@@ -6,7 +6,18 @@
   const defaultSettings = Object.freeze({
     enabled: true,
     namePrefix: 'Janitor - ',
-    useServerDownloadFallback: true, // если CORS/Cloudflare не даст fetch
+
+    // 1) сначала пытаемся напрямую (самый приватный вариант)
+    tryDirectFetch: true,
+
+    // 2) если CORS мешает — используем браузерный прокси (НЕ требует config.yaml)
+    useJinaProxyFallback: true,
+
+    // 3) если включено — можно попытаться /api/assets/download (но у многих будет 403 без whitelist)
+    useServerDownloadFallback: false,
+
+    // какой прокси использовать (можно расширять списком)
+    jinaBase: 'https://r.jina.ai/',
   });
 
   function ctx() { return SillyTavern.getContext(); }
@@ -20,7 +31,7 @@
     return extensionSettings[MODULE_KEY];
   }
 
-  // ---------- UI (Extensions settings) ----------
+  // ---------- UI ----------
 
   async function mountSettingsUi() {
     const target = $('#extensions_settings2').length ? '#extensions_settings2' : '#extensions_settings';
@@ -46,29 +57,39 @@
           </label>
 
           <label class="jsi_ck" style="margin-left:10px">
-            <input type="checkbox" id="jsi_fallback" ${s.useServerDownloadFallback ? 'checked' : ''}>
-            <span>Fallback через сервер ST</span>
+            <input type="checkbox" id="jsi_direct" ${s.tryDirectFetch ? 'checked' : ''}>
+            <span>Сначала прямой fetch</span>
+          </label>
+
+          <label class="jsi_ck" style="margin-left:10px">
+            <input type="checkbox" id="jsi_jina" ${s.useJinaProxyFallback ? 'checked' : ''}>
+            <span>Fallback через r.jina.ai (без config)</span>
+          </label>
+
+          <label class="jsi_ck" style="margin-left:10px">
+            <input type="checkbox" id="jsi_server" ${s.useServerDownloadFallback ? 'checked' : ''}>
+            <span>Fallback через сервер ST (/api/assets/download)</span>
           </label>
         </div>
 
+        <div class="jsi_warn">
+          ⚠️ r.jina.ai — сторонний “reader”-прокси. Если включён, ссылка/контент будут проходить через него.
+          Если это не ок — выключи галку и используй прямой fetch (если работает).
+        </div>
+
         <div class="jsi_help">
-          Вставь ссылку вида <code>janitorai.com/scripts/UUID</code> и нажми Импорт.<br>
-          Создаст новый World Info (лорбук) и добавит туда entries.
+          Поддерживает ссылки вида <code>janitorai.com/scripts/UUID</code>.<br>
+          Импорт создаёт новый World Info и переносит entries (ключи/контент/приоритет).
         </div>
 
         <div class="jsi_status" id="jsi_status"></div>
       </div>
     `);
 
-    $('#jsi_enabled').on('change', () => {
-      getSettings().enabled = $('#jsi_enabled').prop('checked');
-      ctx().saveSettingsDebounced();
-    });
-
-    $('#jsi_fallback').on('change', () => {
-      getSettings().useServerDownloadFallback = $('#jsi_fallback').prop('checked');
-      ctx().saveSettingsDebounced();
-    });
+    $('#jsi_enabled').on('change', () => { getSettings().enabled = $('#jsi_enabled').prop('checked'); ctx().saveSettingsDebounced(); });
+    $('#jsi_direct').on('change',  () => { getSettings().tryDirectFetch = $('#jsi_direct').prop('checked'); ctx().saveSettingsDebounced(); });
+    $('#jsi_jina').on('change',    () => { getSettings().useJinaProxyFallback = $('#jsi_jina').prop('checked'); ctx().saveSettingsDebounced(); });
+    $('#jsi_server').on('change',  () => { getSettings().useServerDownloadFallback = $('#jsi_server').prop('checked'); ctx().saveSettingsDebounced(); });
 
     $('#jsi_import_btn').on('click', async () => {
       const url = String($('#jsi_url').val() ?? '').trim();
@@ -89,7 +110,8 @@
   // ---------- URL helpers ----------
 
   function isJanitorScriptsUrl(url) {
-    return typeof url === 'string' && /https?:\/\/(www\.)?janitorai\.com\/scripts\/[a-f0-9\-]{36}/i.test(url);
+    return typeof url === 'string'
+      && /https?:\/\/(www\.)?janitorai\.com\/scripts\/[a-f0-9\-]{36}/i.test(url);
   }
 
   function extractUuidFromUrl(url) {
@@ -104,7 +126,7 @@
     return s.split(/[,;|\n]/g).map(x => x.trim()).filter(Boolean);
   }
 
-  // ---------- Fetch (direct + fallback) ----------
+  // ---------- Fetch methods ----------
 
   async function fetchTextDirect(url) {
     const r = await fetch(url, { method: 'GET' });
@@ -112,10 +134,18 @@
     return await r.text();
   }
 
+  async function fetchTextViaJina(url) {
+    const s = getSettings();
+    const base = String(s.jinaBase || 'https://r.jina.ai/').replace(/\/+$/, '/') ;
+    // r.jina.ai принимает полный URL прямо после /
+    // пример: https://r.jina.ai/https://janitorai.com/scripts/...
+    const proxyUrl = base + url;
+    const r = await fetch(proxyUrl, { method: 'GET' });
+    if (!r.ok) throw new Error(`Jina HTTP ${r.status} ${r.statusText}`);
+    return await r.text();
+  }
+
   async function fetchTextViaServer(url) {
-    // Важно: эта возможность связана с whitelistImportDomains в config.yaml (ST 1.16+)
-    // иначе сервер может отказать (и это правильно).
-    // См. advisory: введён whitelist для asset download запросов. :contentReference[oaicite:4]{index=4}
     const resp = await fetch('/api/assets/download', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -128,24 +158,41 @@
     return await resp.text();
   }
 
-  async function fetchText(url) {
+  async function fetchTextSmart(url) {
     const s = getSettings();
-    try {
-      return await fetchTextDirect(url);
-    } catch (e) {
-      if (!s.useServerDownloadFallback) throw new Error('Direct fetch blocked (CORS/Cloudflare). Включи fallback.');
-      // Разрешаем fallback только на janitorai.com, чтобы не делать “скачай что угодно”.
-      if (!/^https?:\/\/(www\.)?janitorai\.com\//i.test(url)) throw new Error('Fallback разрешён только для janitorai.com');
-      return await fetchTextViaServer(url);
+    const errors = [];
+
+    if (s.tryDirectFetch) {
+      try { return await fetchTextDirect(url); }
+      catch (e) { errors.push(`direct: ${e?.message || e}`); }
     }
+
+    if (s.useJinaProxyFallback) {
+      try { return await fetchTextViaJina(url); }
+      catch (e) { errors.push(`jina: ${e?.message || e}`); }
+    }
+
+    if (s.useServerDownloadFallback) {
+      try { return await fetchTextViaServer(url); }
+      catch (e) { errors.push(`server: ${e?.message || e}`); }
+    }
+
+    throw new Error(`Не удалось скачать. Причины: ${errors.join(' | ')}`);
   }
 
-  async function fetchJson(url) {
-    const text = await fetchText(url);
+  async function fetchJsonSmart(url) {
+    const text = await fetchTextSmart(url);
     try { return JSON.parse(text); } catch {}
+
+    // если это HTML (страница), попробуем __NEXT_DATA__
+    const next = extractNextData(text);
+    if (next) return next;
+
+    // последняя попытка — выдернуть JSON-объект
     const m = text.match(/\{[\s\S]*\}/);
     if (m) return JSON.parse(m[0]);
-    throw new Error('Не смог распарсить JSON');
+
+    throw new Error('Не смог распарсить JSON/NextData');
   }
 
   function extractNextData(html) {
@@ -179,24 +226,26 @@
   }
 
   async function fetchJanitorScript(uuid36, pageUrl) {
-    // Janitor endpoint’ы гуляли, поэтому пробуем несколько вариантов + __NEXT_DATA__ со страницы
+    // пробуем JSON endpoint’ы, потом страницу
     const candidates = [
       `https://janitorai.com/api/scripts/${uuid36}`,
       `https://janitorai.com/api/script/${uuid36}`,
+      pageUrl,
     ];
 
-    for (const u of candidates) {
+    // 1) api
+    for (const u of candidates.slice(0, 2)) {
       try {
-        const j = await fetchJson(u);
+        const j = await fetchJsonSmart(u);
         if (j && typeof j === 'object') return j;
       } catch {}
     }
 
-    const html = await fetchText(pageUrl);
-    const next = extractNextData(html);
-    if (next) return next;
+    // 2) страница
+    const pageObj = await fetchJsonSmart(pageUrl);
+    if (pageObj && typeof pageObj === 'object') return pageObj;
 
-    throw new Error('Не смог получить данные (API и __NEXT_DATA__ не сработали)');
+    throw new Error('Не смог получить данные ни через API, ни через страницу');
   }
 
   // ---------- Convert Janitor → ST World Info ----------
@@ -240,11 +289,9 @@
     return { title, entries };
   }
 
-  // ---------- Save to World Info через world-info.js ----------
+  // ---------- Save to World Info (через internal world-info.js) ----------
 
   async function worldInfoApi() {
-    // В браузерном контексте ST world-info.js лежит в /scripts/world-info.js
-    // Мы находимся в /scripts/extensions/<ext>/index.js → два уровня вверх.
     return await import('../../world-info.js');
   }
 
@@ -262,7 +309,6 @@
 
     const baseName = sanitizeName(`${s.namePrefix || ''}${title}`);
 
-    // если имя занято — добавим суффикс
     const existing = new Set((wi.world_names || []).map(x => String(x).toLowerCase()));
     let finalName = baseName;
     if (existing.has(baseName.toLowerCase())) {
@@ -320,8 +366,6 @@
       console.error('[JSI] import failed', e);
       setStatus('Ошибка');
       toastr.error(`[JSI] ${e?.message || e}`);
-      // если fallback включён и всё равно не вышло — почти всегда это whitelistImportDomains на сервере
-      // см. advisory про whitelist и config.yaml. :contentReference[oaicite:5]{index=5}
     }
   }
 
