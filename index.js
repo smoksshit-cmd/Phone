@@ -1,22 +1,11 @@
 (() => {
   'use strict';
 
-  const MODULE_KEY = 'janitor_importer_drawer';
-  const FAB_POS_KEY = 'ji_fab_pos_v1';
-  const FAB_MARGIN = 10;
+  const MODULE_KEY = 'janitor_importer';
 
   const defaultSettings = Object.freeze({
     enabled: true,
     showWidget: true,
-
-    // Local Bridge (рекомендуется, потому что у тебя Janitor даёт 403 verify)
-    useLocalBridge: true,
-    bridgeUrl: 'http://127.0.0.1:3857/import', // POST { url }
-
-    // Direct fetch (обычно не работает из-за CORS/verify, оставил как опцию)
-    tryDirectFetch: false,
-
-    // Имя создаваемого лорбука
     namePrefix: 'Janitor - ',
   });
 
@@ -24,94 +13,13 @@
 
   function getSettings() {
     const { extensionSettings } = ctx();
-    if (!extensionSettings[MODULE_KEY]) extensionSettings[MODULE_KEY] = structuredClone(defaultSettings);
+    if (!extensionSettings[MODULE_KEY])
+      extensionSettings[MODULE_KEY] = structuredClone(defaultSettings);
     for (const k of Object.keys(defaultSettings)) {
-      if (!Object.hasOwn(extensionSettings[MODULE_KEY], k)) {
+      if (!Object.hasOwn(extensionSettings[MODULE_KEY], k))
         extensionSettings[MODULE_KEY][k] = defaultSettings[k];
-      }
     }
     return extensionSettings[MODULE_KEY];
-  }
-
-  function clamp(v, mn, mx) { return Math.max(mn, Math.min(mx, v)); }
-
-  function vpW() { return window.visualViewport?.width || window.innerWidth; }
-  function vpH() { return window.visualViewport?.height || window.innerHeight; }
-
-  function setStatus(text) {
-    const el = document.getElementById('ji_status');
-    if (el) el.textContent = text ? String(text) : '';
-  }
-
-  function isJanitorScriptUrl(url) {
-    return /https?:\/\/(www\.)?janitorai\.com\/scripts\/[a-f0-9\-]{36}/i.test(String(url || ''));
-  }
-
-  // ---------------- Settings UI (Extensions panel) ----------------
-
-  async function mountSettingsUi() {
-    const target = $('#extensions_settings2').length ? '#extensions_settings2' : '#extensions_settings';
-    if (!$(target).length) return;
-    if ($('#ji_settings_block').length) return;
-
-    const s = getSettings();
-
-    $(target).append(`
-      <div id="ji_settings_block">
-        <div class="ji_s_title">📦 Janitor Importer (Drawer UI)</div>
-
-        <div class="ji_row" style="margin-top:6px">
-          <label class="ji_ck">
-            <input type="checkbox" id="ji_enabled" ${s.enabled ? 'checked' : ''}>
-            <span>Включено</span>
-          </label>
-
-          <label class="ji_ck" style="margin-left:10px">
-            <input type="checkbox" id="ji_show_widget" ${s.showWidget ? 'checked' : ''}>
-            <span>Плавающая кнопка (FAB)</span>
-          </label>
-        </div>
-
-        <div class="ji_row" style="margin-top:6px">
-          <label class="ji_ck">
-            <input type="checkbox" id="ji_use_bridge" ${s.useLocalBridge ? 'checked' : ''}>
-            <span>Использовать Local Bridge</span>
-          </label>
-
-          <label class="ji_ck" style="margin-left:10px">
-            <input type="checkbox" id="ji_try_direct" ${s.tryDirectFetch ? 'checked' : ''}>
-            <span>Пробовать Direct Fetch</span>
-          </label>
-        </div>
-
-        <div class="ji_row" style="margin-top:6px">
-          <input type="text" id="ji_bridge_url" value="${escapeHtml(s.bridgeUrl)}" placeholder="http://127.0.0.1:3857/import" />
-        </div>
-
-        <div class="ji_s_help">
-          UI как у FMT: кнопка 🧩 → боковая панель → вставляешь ссылку Janitor /scripts/UUID → Import.<br>
-          В твоём случае Janitor возвращает <b>403 Security Verification</b>, поэтому без Local Bridge автозагрузка не работает.
-        </div>
-
-        <div class="ji_row" style="margin-top:8px">
-          <button class="menu_button" id="ji_open_drawer_btn">📂 Открыть панель</button>
-          <button class="menu_button" id="ji_reset_pos_btn">↺ Позиция FAB</button>
-        </div>
-      </div>
-    `);
-
-    $('#ji_enabled').on('change', () => { getSettings().enabled = $('#ji_enabled').prop('checked'); ctx().saveSettingsDebounced(); });
-    $('#ji_show_widget').on('change', async () => { getSettings().showWidget = $('#ji_show_widget').prop('checked'); ctx().saveSettingsDebounced(); await renderWidget(); });
-    $('#ji_use_bridge').on('change', () => { getSettings().useLocalBridge = $('#ji_use_bridge').prop('checked'); ctx().saveSettingsDebounced(); });
-    $('#ji_try_direct').on('change', () => { getSettings().tryDirectFetch = $('#ji_try_direct').prop('checked'); ctx().saveSettingsDebounced(); });
-
-    $('#ji_bridge_url').on('input', () => {
-      getSettings().bridgeUrl = String($('#ji_bridge_url').val() || '').trim();
-      ctx().saveSettingsDebounced();
-    });
-
-    $('#ji_open_drawer_btn').on('click', () => openDrawer(true));
-    $('#ji_reset_pos_btn').on('click', () => { localStorage.removeItem(FAB_POS_KEY); applyFabPosition(); });
   }
 
   function escapeHtml(s) {
@@ -121,345 +29,353 @@
       .replaceAll("'",'&#039;');
   }
 
-  // ---------------- FAB + Drawer (FMT-like) ----------------
+  // ── Стили ──────────────────────────────────────────────────────────────────
+  function injectStyles() {
+    if (document.getElementById('ji_styles')) return;
+    const s = document.createElement('style');
+    s.id = 'ji_styles';
+    s.textContent = `
+      #ji_fab {
+        position:fixed; z-index:9998; display:flex;
+        flex-direction:column; width:150px;
+        border-radius:10px; overflow:hidden;
+        box-shadow:0 4px 20px rgba(0,0,0,.5);
+        border:1px solid rgba(255,255,255,.1);
+        right:14px; bottom:120px;
+      }
+      #ji_fab_btn {
+        background:linear-gradient(135deg,#2a2a3e,#1a1a2e);
+        border:none; color:#e0e0ff; padding:10px 12px;
+        cursor:pointer; text-align:left; font-family:inherit;
+        line-height:1.3; user-select:none;
+      }
+      #ji_fab_btn:hover { background:linear-gradient(135deg,#3a3a5e,#2a2a4e); }
+      #ji_fab_btn .ji_big   { font-size:13px; font-weight:bold; }
+      #ji_fab_btn .ji_small { font-size:10px; opacity:.6; margin-top:2px; }
+      #ji_fab_hide {
+        background:rgba(0,0,0,.4); border:none;
+        border-top:1px solid rgba(255,255,255,.08);
+        color:#888; font-size:11px; padding:4px;
+        cursor:pointer; font-family:inherit;
+      }
+      #ji_fab_hide:hover { color:#fff; background:rgba(255,50,50,.3); }
 
-  function ensureFab() {
-    if (document.getElementById('ji_fab')) return;
+      #ji_overlay {
+        display:none; position:fixed; inset:0;
+        background:rgba(0,0,0,.55); z-index:9999;
+        backdrop-filter:blur(2px);
+      }
 
-    $('body').append(`
-      <div id="ji_fab">
-        <button type="button" id="ji_fab_btn" title="Janitor Import">
-          <div class="ji_big">🧩 Janitor</div>
-          <div class="ji_small">Import scripts → World Info</div>
-        </button>
-        <button type="button" id="ji_fab_hide" title="Скрыть">✕</button>
-      </div>
-    `);
+      #ji_drawer {
+        position:fixed; top:0; right:0;
+        width:420px; max-width:100vw; height:100vh;
+        background:#1a1a2e;
+        border-left:1px solid rgba(255,255,255,.12);
+        z-index:10000; transform:translateX(100%);
+        transition:transform .25s ease;
+        display:flex; flex-direction:column;
+        box-shadow:-4px 0 30px rgba(0,0,0,.6);
+        overflow:hidden;
+      }
+      #ji_drawer.ji-open { transform:translateX(0); }
 
-    $('#ji_fab_btn').on('click', () => openDrawer(true));
-    $('#ji_fab_hide').on('click', async () => {
-      getSettings().showWidget = false;
-      ctx().saveSettingsDebounced();
-      await renderWidget();
-      toastr.info('Кнопка скрыта (включается в настройках расширения)');
-    });
+      #ji_drawer header {
+        padding:16px 18px 12px;
+        border-bottom:1px solid rgba(255,255,255,.08);
+        background:rgba(0,0,0,.2); flex-shrink:0;
+      }
+      .ji_topline { display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; }
+      .ji_title   { font-size:16px; font-weight:bold; color:#e0e0ff; }
+      #ji_close {
+        background:none; border:none; color:#888;
+        font-size:18px; cursor:pointer; padding:0 4px;
+        line-height:1; font-family:inherit;
+      }
+      #ji_close:hover { color:#fff; }
+      .ji_subtitle { font-size:11px; color:#888; line-height:1.6; }
 
-    initFabDrag();
-    applyFabPosition();
+      #ji_drawer .ji_content {
+        padding:16px 18px; display:flex;
+        flex-direction:column; gap:10px;
+        overflow-y:auto; flex:1;
+      }
+      .ji_label { font-size:12px; color:#999; margin-bottom:3px; }
+
+      #ji_name_input, #ji_json_area {
+        width:100%; box-sizing:border-box;
+        background:rgba(255,255,255,.06);
+        border:1px solid rgba(255,255,255,.15);
+        border-radius:6px; color:#e0e0ff;
+        padding:8px 10px; font-size:12px;
+        font-family:inherit; outline:none; resize:vertical;
+      }
+      #ji_name_input:focus, #ji_json_area:focus {
+        border-color:rgba(120,120,255,.5);
+        background:rgba(255,255,255,.09);
+      }
+      #ji_json_area { height:220px; font-family:monospace; font-size:11px; }
+
+      .ji_row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+
+      #ji_status {
+        font-size:12px; white-space:pre-line; line-height:1.6;
+        min-height:20px; padding:8px 10px;
+        background:rgba(0,0,0,.25); border-radius:6px; color:#ccc;
+        border:1px solid rgba(255,255,255,.06);
+      }
+
+      .ji_hint {
+        font-size:11px; color:#666; line-height:1.7;
+        border-top:1px solid rgba(255,255,255,.06);
+        padding-top:10px;
+      }
+      .ji_hint code {
+        background:rgba(255,255,255,.07); padding:1px 5px;
+        border-radius:3px; font-size:10px; color:#aaa;
+      }
+      .ji_step { display:flex; gap:8px; align-items:flex-start; margin-bottom:6px; }
+      .ji_step_num {
+        background:rgba(120,120,255,.25); color:#aaf;
+        border-radius:50%; width:18px; height:18px; flex-shrink:0;
+        display:flex; align-items:center; justify-content:center;
+        font-size:10px; font-weight:bold; margin-top:1px;
+      }
+      .ji_step_txt { font-size:11px; color:#888; line-height:1.6; }
+
+      #ji_settings_block {
+        margin:10px 0; padding:12px;
+        background:rgba(255,255,255,.03);
+        border:1px solid rgba(255,255,255,.08);
+        border-radius:8px;
+      }
+      .ji_s_title { font-weight:bold; font-size:14px; margin-bottom:8px; }
+      .ji_ck { display:flex; align-items:center; gap:5px; font-size:12px; cursor:pointer; }
+    `;
+    document.head.appendChild(s);
   }
 
+  // ── Settings UI ────────────────────────────────────────────────────────────
+  async function mountSettingsUi() {
+    const target = $('#extensions_settings2').length ? '#extensions_settings2' : '#extensions_settings';
+    if (!$(target).length || $('#ji_settings_block').length) return;
+    const s = getSettings();
+    $(target).append(`
+      <div id="ji_settings_block">
+        <div class="ji_s_title">🧩 Janitor Importer</div>
+        <div class="ji_row">
+          <label class="ji_ck">
+            <input type="checkbox" id="ji_enabled" ${s.enabled?'checked':''}>
+            <span>Включено</span>
+          </label>
+          <label class="ji_ck" style="margin-left:8px">
+            <input type="checkbox" id="ji_show_widget" ${s.showWidget?'checked':''}>
+            <span>Показывать кнопку</span>
+          </label>
+        </div>
+        <div style="margin-top:8px">
+          <button class="menu_button" id="ji_open_btn">📂 Открыть панель</button>
+        </div>
+      </div>
+    `);
+    $('#ji_enabled').on('change', () => { getSettings().enabled = $('#ji_enabled').prop('checked'); ctx().saveSettingsDebounced(); renderFab(); });
+    $('#ji_show_widget').on('change', () => { getSettings().showWidget = $('#ji_show_widget').prop('checked'); ctx().saveSettingsDebounced(); renderFab(); });
+    $('#ji_open_btn').on('click', () => openDrawer(true));
+  }
+
+  // ── FAB ────────────────────────────────────────────────────────────────────
+  function renderFab() {
+    if (!document.getElementById('ji_fab')) {
+      $('body').append(`
+        <div id="ji_fab">
+          <button type="button" id="ji_fab_btn">
+            <div class="ji_big">🧩 Janitor</div>
+            <div class="ji_small">Вставить лорбук</div>
+          </button>
+          <button type="button" id="ji_fab_hide">✕ скрыть</button>
+        </div>
+      `);
+      $('#ji_fab_btn').on('click', () => openDrawer(true));
+      $('#ji_fab_hide').on('click', () => {
+        getSettings().showWidget = false;
+        ctx().saveSettingsDebounced();
+        renderFab();
+        toastr.info('Кнопка скрыта. Включи в настройках расширения.');
+      });
+    }
+    const s = getSettings();
+    document.getElementById('ji_fab').style.display =
+      s.enabled && s.showWidget ? 'flex' : 'none';
+  }
+
+  // ── Drawer ─────────────────────────────────────────────────────────────────
   function ensureDrawer() {
     if (document.getElementById('ji_drawer')) return;
 
     $('body').append(`<div id="ji_overlay"></div>`);
-
     $('body').append(`
       <aside id="ji_drawer" aria-hidden="true">
         <header>
-          <div class="topline">
-            <div class="title">🧩 Janitor Import</div>
+          <div class="ji_topline">
+            <div class="ji_title">🧩 Janitor → World Info</div>
             <button id="ji_close" type="button">✕</button>
           </div>
-          <div class="subtitle">
-            Вставь ссылку вида <code>https://janitorai.com/scripts/UUID</code> и импортируй в World Info.<br>
-            Если Janitor отдаёт “Security Verification”, включай Local Bridge.
-          </div>
+          <div class="ji_subtitle">Скопируй JSON с Janitor и вставь сюда — создастся World Info в ST.</div>
         </header>
-
-        <div class="content">
-          <div class="ji_block">
-            <div class="ji_row">
-              <input id="ji_url" type="text" placeholder="https://janitorai.com/scripts/..." />
+        <div class="ji_content">
+          <div>
+            <div class="ji_label">Название World Info:</div>
+            <input id="ji_name_input" type="text" placeholder="Оставь пустым — определится автоматически" />
+          </div>
+          <div>
+            <div class="ji_label">JSON из Janitor (Ctrl+V):</div>
+            <textarea id="ji_json_area" placeholder='[ { "key": [...], "content": "...", "comment": "...", ... } ]'></textarea>
+          </div>
+          <div class="ji_row">
+            <button class="menu_button" id="ji_import_btn">⬇ Импортировать</button>
+            <button class="menu_button" id="ji_clear_btn">✕ Очистить</button>
+          </div>
+          <div id="ji_status"></div>
+          <div class="ji_hint">
+            <div class="ji_step">
+              <div class="ji_step_num">1</div>
+              <div class="ji_step_txt">Открой страницу скрипта на Janitor</div>
             </div>
-
-            <div class="ji_row">
-              <label class="ji_ck">
-                <input type="checkbox" id="ji_use_bridge_drawer">
-                <span>Local Bridge</span>
-              </label>
-
-              <label class="ji_ck" style="margin-left:10px">
-                <input type="checkbox" id="ji_try_direct_drawer">
-                <span>Direct Fetch</span>
-              </label>
+            <div class="ji_step">
+              <div class="ji_step_num">2</div>
+              <div class="ji_step_txt">Нажми кнопку <b>View script</b> → откроется окно <b>View Lorebook</b></div>
             </div>
-
-            <div class="ji_row">
-              <input id="ji_bridge_url_drawer" type="text" placeholder="http://127.0.0.1:3857/import" />
+            <div class="ji_step">
+              <div class="ji_step_num">3</div>
+              <div class="ji_step_txt">Кликни в область с кодом → <b>Ctrl+A</b> → <b>Ctrl+C</b></div>
             </div>
-
-            <div class="ji_row" id="ji_actions">
-              <button class="menu_button" id="ji_import_btn">Импорт</button>
-              <button class="menu_button" id="ji_clear_btn">Очистить</button>
+            <div class="ji_step">
+              <div class="ji_step_num">4</div>
+              <div class="ji_step_txt">Вернись сюда, вставь <b>Ctrl+V</b> в поле выше → <b>Импортировать</b></div>
             </div>
-
-            <div class="ji_hint">
-              World Info будет создан как <b>${escapeHtml(getSettings().namePrefix)}</b> + название (или UUID, если названия нет).
-            </div>
-
-            <div id="ji_status"></div>
           </div>
         </div>
       </aside>
     `);
 
     $('#ji_overlay').on('click', () => openDrawer(false));
-    $('#ji_close').on('click', () => openDrawer(false));
-
+    $('#ji_close').on('click',   () => openDrawer(false));
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && document.getElementById('ji_drawer')?.classList.contains('ji-open')) {
+      if (e.key === 'Escape' && document.getElementById('ji_drawer')?.classList.contains('ji-open'))
         openDrawer(false);
-      }
     });
 
-    $('#ji_import_btn').on('click', async () => {
-      const url = String($('#ji_url').val() || '').trim();
-      await importFlow(url);
-    });
-
-    $('#ji_url').on('keydown', async (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        const url = String($('#ji_url').val() || '').trim();
-        await importFlow(url);
-      }
-    });
-
+    $('#ji_import_btn').on('click', doImport);
     $('#ji_clear_btn').on('click', () => {
-      $('#ji_url').val('');
+      $('#ji_json_area').val('');
+      $('#ji_name_input').val('');
       setStatus('');
+    });
+
+    // Авто-имя при вставке
+    $('#ji_json_area').on('input paste', () => {
+      setTimeout(() => {
+        if ($('#ji_name_input').val().trim()) return;
+        const name = guessName(String($('#ji_json_area').val()).trim());
+        if (name) $('#ji_name_input').val(name);
+      }, 120);
     });
   }
 
   function openDrawer(open) {
     ensureDrawer();
-
-    const drawer = document.getElementById('ji_drawer');
+    const drawer  = document.getElementById('ji_drawer');
     const overlay = document.getElementById('ji_overlay');
     if (!drawer || !overlay) return;
-
     if (open) {
-      // sync drawer controls with settings
-      const s = getSettings();
-      $('#ji_use_bridge_drawer').prop('checked', !!s.useLocalBridge);
-      $('#ji_try_direct_drawer').prop('checked', !!s.tryDirectFetch);
-      $('#ji_bridge_url_drawer').val(s.bridgeUrl || '');
-
       overlay.style.display = 'block';
       drawer.classList.add('ji-open');
-      drawer.setAttribute('aria-hidden', 'false');
+      drawer.setAttribute('aria-hidden','false');
       setStatus('');
-      setTimeout(() => document.getElementById('ji_url')?.focus(), 50);
+      setTimeout(() => document.getElementById('ji_json_area')?.focus(), 50);
     } else {
       overlay.style.display = 'none';
       drawer.classList.remove('ji-open');
-      drawer.setAttribute('aria-hidden', 'true');
+      drawer.setAttribute('aria-hidden','true');
     }
   }
 
-  async function renderWidget() {
-    ensureFab();
-    const s = getSettings();
-    const el = document.getElementById('ji_fab');
+  function setStatus(text, color) {
+    const el = document.getElementById('ji_status');
     if (!el) return;
-    el.style.display = s.enabled && s.showWidget ? 'flex' : 'none';
+    el.textContent = text || '';
+    el.style.color = color || '#ccc';
   }
 
-  // ---------------- Drag FAB (простая версия как у FMT) ----------------
-
-  function applyFabPosition() {
-    const el = document.getElementById('ji_fab');
-    if (!el) return;
-
-    const W = 180, H = 96;
+  // ── Угадать название ───────────────────────────────────────────────────────
+  function guessName(raw) {
     try {
-      const raw = localStorage.getItem(FAB_POS_KEY);
-      if (!raw) {
-        el.style.left = (vpW() - W - 14) + 'px';
-        el.style.top = (vpH() - H - 120) + 'px';
-        return;
+      const p = JSON.parse(raw);
+      if (Array.isArray(p)) {
+        // Берём comment первого entry как базу для имени
+        const first = p[0];
+        if (first?.comment) return String(first.comment).split(/[\n\/]/)[0].trim().slice(0,60);
+        return '';
       }
-      const pos = JSON.parse(raw);
-      const left = clamp(pos.left ?? (vpW() - W - 14), FAB_MARGIN, vpW() - W - FAB_MARGIN);
-      const top = clamp(pos.top ?? (vpH() - H - 120), FAB_MARGIN, vpH() - H - FAB_MARGIN);
-      el.style.left = left + 'px';
-      el.style.top = top + 'px';
-      el.style.right = 'auto';
-      el.style.bottom = 'auto';
-    } catch {
-      localStorage.removeItem(FAB_POS_KEY);
+      return String(p.title || p.name || p.script_name || '').trim().slice(0,60);
+    } catch { return ''; }
+  }
+
+  // ── Import ─────────────────────────────────────────────────────────────────
+  async function doImport() {
+    const s = getSettings();
+    if (!s.enabled) { toastr.warning('Расширение отключено'); return; }
+
+    const raw       = String($('#ji_json_area').val() || '').trim();
+    const nameInput = String($('#ji_name_input').val() || '').trim();
+
+    if (!raw) { setStatus('❌ Вставь JSON из Janitor', '#f88'); return; }
+
+    setStatus('⏳ Парсинг…');
+
+    let parsed;
+    try { parsed = JSON.parse(raw); }
+    catch (e) { setStatus(`❌ Неверный JSON:\n${e.message}`, '#f88'); return; }
+
+    const entries = normalizeEntries(parsed);
+    if (!entries.length) {
+      setStatus('❌ Не найдено ни одного entry.\nПроверь что скопировал весь JSON.', '#f88');
+      return;
     }
-  }
 
-  function initFabDrag() {
-    const el = document.getElementById('ji_fab');
-    const handle = document.getElementById('ji_fab_btn');
-    if (!el || !handle || el.dataset.dragInit === '1') return;
-    el.dataset.dragInit = '1';
-
-    let sx = 0, sy = 0, sl = 0, st = 0, moved = false;
-
-    const onMove = (ev) => {
-      const dx = ev.clientX - sx;
-      const dy = ev.clientY - sy;
-      if (!moved && Math.abs(dx) + Math.abs(dy) > 6) moved = true;
-      if (!moved) return;
-
-      const W = 180, H = 96;
-      const left = clamp(sl + dx, FAB_MARGIN, vpW() - W - FAB_MARGIN);
-      const top = clamp(st + dy, FAB_MARGIN, vpH() - H - FAB_MARGIN);
-      el.style.left = left + 'px';
-      el.style.top = top + 'px';
-      el.style.right = 'auto';
-      el.style.bottom = 'auto';
-      ev.preventDefault();
-      ev.stopPropagation();
-    };
-
-    const onEnd = () => {
-      document.removeEventListener('pointermove', onMove, { passive: false });
-      document.removeEventListener('pointerup', onEnd);
-      document.removeEventListener('pointercancel', onEnd);
-
-      if (moved) {
-        const left = parseInt(el.style.left) || 0;
-        const top = parseInt(el.style.top) || 0;
-        localStorage.setItem(FAB_POS_KEY, JSON.stringify({ left, top }));
-      }
-      moved = false;
-    };
-
-    handle.addEventListener('pointerdown', (ev) => {
-      if (ev.pointerType === 'mouse' && ev.button !== 0) return;
-
-      sx = ev.clientX;
-      sy = ev.clientY;
-      sl = parseInt(el.style.left) || (vpW() - 180 - 14);
-      st = parseInt(el.style.top) || (vpH() - 96 - 120);
-      moved = false;
-
-      document.addEventListener('pointermove', onMove, { passive: false });
-      document.addEventListener('pointerup', onEnd, { passive: true });
-      document.addEventListener('pointercancel', onEnd, { passive: true });
-      ev.preventDefault();
-    }, { passive: false });
-
-    window.addEventListener('resize', () => setTimeout(applyFabPosition, 150));
-    if (window.visualViewport) window.visualViewport.addEventListener('resize', () => setTimeout(applyFabPosition, 150));
-  }
-
-  // ---------------- Import logic ----------------
-
-  async function importFlow(url) {
-    const s = getSettings();
-    if (!s.enabled) { toastr.warning('[JI] Расширение отключено'); return; }
-    if (!isJanitorScriptUrl(url)) { toastr.error('[JI] Нужна ссылка вида https://janitorai.com/scripts/<UUID>'); return; }
-
-    // save drawer toggles -> settings (чтобы было как у FMT: состояние запоминается)
-    const useBridge = $('#ji_use_bridge_drawer').prop('checked');
-    const tryDirect = $('#ji_try_direct_drawer').prop('checked');
-    const bridgeUrl = String($('#ji_bridge_url_drawer').val() || '').trim();
-
-    s.useLocalBridge = !!useBridge;
-    s.tryDirectFetch = !!tryDirect;
-    if (bridgeUrl) s.bridgeUrl = bridgeUrl;
-    ctx().saveSettingsDebounced();
-
-    setStatus('Импорт: старт…');
+    const title = sanitizeName(`${s.namePrefix || ''}${nameInput || guessName(raw) || 'Lorebook'}`);
+    setStatus(`⏳ Создаю World Info…\nEntries: ${entries.length}`);
 
     try {
-      let payload = null;
-
-      if (s.useLocalBridge) {
-        setStatus('Импорт: обращаюсь к Local Bridge…');
-        payload = await fetchViaBridge(s.bridgeUrl, url);
-      } else if (s.tryDirectFetch) {
-        setStatus('Импорт: пробую direct fetch…');
-        payload = await fetchDirectJanitor(url);
-      } else {
-        throw new Error('Нужно включить Local Bridge (у тебя Janitor отдаёт Security Verification).');
-      }
-
-      // payload должен быть объектом вида { title, entries:[{key,content,comment,order,...}] }
-      const norm = normalizeBridgePayload(payload);
-      if (!norm.entries.length) throw new Error('Bridge вернул 0 entries (проверь ссылку/доступ).');
-
-      setStatus(`Создаю World Info…\nentries: ${norm.entries.length}`);
-      const worldName = await createAndFillWorldInfo(norm.title, norm.entries);
-
-      setStatus(`Готово!\nWorld Info: ${worldName}\nentries: ${norm.entries.length}`);
-      toastr.success(`✅ Импортировано: ${worldName} (${norm.entries.length})`);
-
+      const worldName = await createWorldInfo(title, entries);
+      setStatus(`✅ Готово!\nWorld Info: "${worldName}"\nEntries: ${entries.length}`, '#8f8');
+      toastr.success(`Импортировано: ${worldName} (${entries.length} entries)`);
     } catch (e) {
-      console.error('[JI] import failed', e);
-      setStatus(`Ошибка:\n${e?.message || e}`);
-      toastr.error(`[JI] ${e?.message || e}`);
+      console.error('[JI]', e);
+      setStatus(`❌ Ошибка:\n${e.message}`, '#f88');
+      toastr.error(e.message);
     }
   }
 
-  async function fetchViaBridge(bridgeUrl, janitorUrl) {
-    const u = String(bridgeUrl || '').trim();
-    if (!u) throw new Error('Bridge URL пустой.');
+  function normalizeEntries(parsed) {
+    const raw = Array.isArray(parsed)               ? parsed
+      : Array.isArray(parsed.entries)               ? parsed.entries
+      : Array.isArray(parsed.script?.entries)       ? parsed.script.entries
+      : [];
 
-    const resp = await fetch(u, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: janitorUrl }),
-    });
-
-    const text = await resp.text().catch(() => '');
-    if (!resp.ok) {
-      throw new Error(`Bridge HTTP ${resp.status}: ${text.slice(0, 300)}`);
-    }
-
-    try { return JSON.parse(text); }
-    catch { throw new Error('Bridge вернул не-JSON ответ.'); }
-  }
-
-  async function fetchDirectJanitor(janitorUrl) {
-    // В твоём кейсе это почти наверняка упадёт (CORS/verify),
-    // но оставлено как опция.
-    const resp = await fetch(janitorUrl);
-    const text = await resp.text();
-    if (!resp.ok) throw new Error(`Janitor HTTP ${resp.status}`);
-    // Если прилетела security page — сразу стоп
-    if (/security verification|verify you are human|captcha|forbidden/i.test(text)) {
-      throw new Error('Janitor вернул Security Verification. Нужен Local Bridge.');
-    }
-    // Если вдруг это JSON — ок
-    try { return JSON.parse(text); } catch {}
-    throw new Error('Direct fetch не вернул JSON. Нужен Local Bridge.');
-  }
-
-  function normalizeBridgePayload(p) {
-    if (!p || typeof p !== 'object') throw new Error('Неверный payload от Bridge');
-
-    const title =
-      p.title || p.name || p.script?.title || p.script?.name || `Script ${Date.now()}`;
-
-    const rawEntries =
-      Array.isArray(p.entries) ? p.entries :
-      Array.isArray(p.script?.entries) ? p.script.entries :
-      [];
-
-    const entries = [];
-    for (const e of rawEntries) {
-      const keys = normalizeKeys(e.key ?? e.keys ?? e.keywords ?? e.triggers ?? []);
+    return raw.map((e, i) => {
+      const keys = normalizeKeys(e.key ?? e.keys ?? e.keywords ?? e.activation_keywords ?? e.triggers ?? []);
       const content = String(e.content ?? e.text ?? '').trim();
       const comment = String(e.comment ?? e.name ?? e.title ?? '').trim();
-      if (!content && !keys.length) continue;
-
-      entries.push({
-        key: keys.length ? keys : ['*'],
+      return {
+        key:      keys.length ? keys : ['*'],
         content,
         comment,
-        order: Number.isFinite(+e.order) ? +e.order : 100,
+        order:    Number.isFinite(+e.insertion_order) ? +e.insertion_order
+                : Number.isFinite(+e.order) ? +e.order : (i + 1) * 10,
         constant: !!e.constant,
-        disable: !!e.disable,
-      });
-    }
-
-    return { title, entries };
+        disable:  !(e.enabled !== false) || !!e.disable,
+      };
+    }).filter(e => e.content || e.key[0] !== '*');
   }
 
   function normalizeKeys(v) {
@@ -469,32 +385,16 @@
     return s.split(/[,;|\n]/g).map(x => x.trim()).filter(Boolean);
   }
 
-  // ---------------- Save to World Info using ST internals ----------------
-
-  async function worldInfoApi() {
-    return await import('../../world-info.js');
-  }
-
-  function sanitizeName(name) {
-    return String(name)
-      .replace(/[\\/:*?"<>|]/g, '')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 80) || `Janitor - ${Date.now()}`;
-  }
-
-  async function createAndFillWorldInfo(title, entries) {
-    const s = getSettings();
-    const wi = await worldInfoApi();
-
-    const baseName = sanitizeName(`${s.namePrefix || ''}${title}`);
-
+  // ── World Info ─────────────────────────────────────────────────────────────
+  async function createWorldInfo(name, entries) {
+    const wi = await import('../../world-info.js');
     const existing = new Set((wi.world_names || []).map(x => String(x).toLowerCase()));
-    let finalName = baseName;
-    if (existing.has(baseName.toLowerCase())) {
+
+    let finalName = name;
+    if (existing.has(name.toLowerCase())) {
       for (let i = 2; i < 999; i++) {
-        const cand = `${baseName} (${i})`;
-        if (!existing.has(cand.toLowerCase())) { finalName = cand; break; }
+        const c = `${name} (${i})`;
+        if (!existing.has(c.toLowerCase())) { finalName = c; break; }
       }
     }
 
@@ -503,29 +403,34 @@
 
     for (const e of entries) {
       const dst = wi.createWorldInfoEntry(null, book);
-      dst.key = e.key;
-      dst.comment = e.comment || '';
-      dst.content = e.content || '';
-      dst.order = Number.isFinite(+e.order) ? +e.order : 100;
-      dst.constant = !!e.constant;
-      dst.disable = !!e.disable;
+      dst.key      = e.key;
+      dst.comment  = e.comment  || '';
+      dst.content  = e.content  || '';
+      dst.order    = e.order;
+      dst.constant = e.constant;
+      dst.disable  = e.disable;
     }
 
     await wi.saveWorldInfo(finalName, book, true);
     return finalName;
   }
 
-  // ---------------- Init ----------------
+  function sanitizeName(name) {
+    return String(name).replace(/[\\/:*?"<>|]/g,'').replace(/\s+/g,' ').trim().slice(0,80)
+      || `Janitor - ${Date.now()}`;
+  }
 
+  // ── Init ───────────────────────────────────────────────────────────────────
   jQuery(async () => {
     try {
+      injectStyles();
       getSettings();
       await mountSettingsUi();
       ensureDrawer();
-      await renderWidget();
-      console.log('[JI] Loaded');
+      renderFab();
+      console.log('[JI] Loaded ✓');
     } catch (e) {
-      console.error('[JI] init failed', e);
+      console.error('[JI] init error', e);
     }
   });
 
