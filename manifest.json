@@ -1,15 +1,1 @@
-{
-  "display_name": "Заметки к чатам",
-  "loading_order": 57,
-  "js": [
-    "index.js"
-  ],
-  "css": [
-    "style.css"
-  ],
-  "author": "Smokshi",
-  "version": "1.0.0",
-  "auto_update": true,
-  "homepage": "https://github.com/smoksshit-cmd/SillyTavern-ChatNotes",
-  "requires": []
-}
+
