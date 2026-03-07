@@ -191,6 +191,9 @@
   font-size: 14px;
   display: flex; align-items: center; justify-content: center;
   transition: background 0.15s, color 0.15s;
+  position: relative;
+  z-index: 2;
+  flex-shrink: 0;
 }
 
 .bms-modal-close:hover {
