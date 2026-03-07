@@ -448,7 +448,7 @@
 
   // ── Apply item ────────────────────────────────────────────────────────────
 
-  async function applyItem(invId) {
+  async function applyItem(invId, target = 'char') {
     const state = await getChatState(true);
     const inv   = state.inventory.find(i => i.id === invId);
     if (!inv || inv.qty <= 0) return;
@@ -456,8 +456,15 @@
     const item = ITEMS.find(i => i.id === inv.itemId);
     if (!item) return;
 
+    // Build effect text based on target
+    let effectText = item.effect;
+    if (target === 'user') {
+      // Swap {{char}} and {{user}} roles — effect is applied TO the user, observed by char
+      effectText = item.effectOnUser || buildUserEffect(item);
+    }
+
     try {
-      ctx().setExtensionPrompt(EFFECT_TAG, item.effect, EXT_PROMPT_TYPES.IN_PROMPT, 0, true);
+      ctx().setExtensionPrompt(EFFECT_TAG, effectText, EXT_PROMPT_TYPES.IN_PROMPT, 0, true);
       effectActive = true;
     } catch (e) { console.error('[BMS] inject error', e); }
 
@@ -465,18 +472,48 @@
     if (inv.qty <= 0) state.inventory = state.inventory.filter(i => i.id !== invId);
 
     if (item.add && item.addAmt > 0 && getSettings().addictionEnabled) {
+      const addKey = target === 'user' ? `${item.add}_user` : item.add;
+      // For user target, track separately but same addiction types
       state.addictions[item.add] = Math.min(100, (state.addictions[item.add] || 0) + item.addAmt);
       state.lastUse[item.add]    = Date.now();
     }
 
-    state.txLog.unshift({ ts: Date.now(), type: 'use', desc: `Применено: ${item.name}`, amount: 0 });
+    state.txLog.unshift({
+      ts: Date.now(), type: 'use',
+      desc: `Применено на ${target === 'char' ? '{{char}}' : '{{user}}'}: ${item.name}`,
+      amount: 0,
+    });
 
     await saveState();
     updateFabBadge(state);
     await updateAddictionPrompt();
     await renderShopContent();
 
-    showToast(`${item.icon} <b>${escHtml(item.name)}</b> применён<br><span style="font-size:11px;opacity:.75">Эффект активен до следующего ответа</span>`, 'effect', 5000);
+    const targetLabel = target === 'char' ? 'на персонажа' : 'на себя';
+    showToast(
+      `${item.icon} <b>${escHtml(item.name)}</b> применён ${targetLabel}<br>` +
+      `<span style="font-size:11px;opacity:.75">Эффект активен до следующего ответа</span>`,
+      'effect', 5000
+    );
+  }
+
+  // Build reversed effect when applied to {{user}} instead of {{char}}
+  function buildUserEffect(item) {
+    // Replace perspective: {{user}} experiences it, {{char}} may observe
+    return item.effect
+      .replace(/СКРЫТОЕ СОСТОЯНИЕ {{user}}:/g, 'СКРЫТОЕ СОСТОЯНИЕ {{user}} (применено на себя):')
+      .replace(/{{char}} замечает/g, '{{char}} может заметить')
+      .replace(/{{char}} видит/g, '{{char}} может видеть')
+      .replace(/{{char}} наблюдает/g, '{{char}} может наблюдать')
+      .replace(/{{char}} ощущает/g, '{{char}} может ощутить')
+      .replace(/{{char}} чувствует/g, '{{char}} может почувствовать')
+      // Weapon/poison effects reversed — char is target
+      .replace(/{{user}} незаметно подмешал яд (.+?) {{char}}/g,
+        '{{char}} незаметно использует яд против {{user}}. {{user}} это чувствует')
+      .replace(/{{user}} применил (.+?) на {{char}}/g,
+        '{{char}} применяет $1 на {{user}}')
+      .replace(/{{user}} достал/g, '{{user}} достал')
+      .replace(/{{user}} бросил/g, '{{user}} бросает');
   }
 
   // ── Consume effect ────────────────────────────────────────────────────────
@@ -743,8 +780,12 @@
     `;
     document.body.appendChild(modal);
 
-    document.getElementById('bms_modal_close').addEventListener('click', closeShop);
-    document.addEventListener('keydown', e => { if (e.key === 'Escape' && shopOpen) closeShop(); });
+    // !! Capture phase (true) — иначе ST перехватывает клик раньше нас
+    document.getElementById('bms_modal_close').addEventListener('click', (e) => {
+      e.stopPropagation();
+      closeShop();
+    }, true);
+    document.addEventListener('keydown', e => { if (e.key === 'Escape' && shopOpen) closeShop(); }, true);
 
     modal.querySelectorAll('.bms-tab').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -904,7 +945,14 @@
           </div>
           <div class="bms-inv-right">
             <div class="bms-inv-qty">×${inv.qty}</div>
-            <button class="bms-apply-btn" data-invid="${inv.id}">⚡ Применить</button>
+            <div class="bms-apply-group">
+              <button class="bms-apply-btn bms-apply-char" data-invid="${inv.id}" data-target="char">
+                ⚡ На бота
+              </button>
+              <button class="bms-apply-btn bms-apply-user" data-invid="${inv.id}" data-target="user">
+                💊 На себя
+              </button>
+            </div>
             <button class="bms-discard-btn" data-invid="${inv.id}" title="Выбросить">🗑</button>
           </div>
         </div>`;
@@ -926,7 +974,10 @@
     if (!body) return;
 
     body.querySelectorAll('.bms-apply-btn').forEach(btn => {
-      btn.addEventListener('click', async () => { await applyItem(btn.getAttribute('data-invid')); });
+      btn.addEventListener('click', async () => {
+        const target = btn.getAttribute('data-target') || 'char';
+        await applyItem(btn.getAttribute('data-invid'), target);
+      });
     });
 
     body.querySelectorAll('.bms-discard-btn').forEach(btn => {
