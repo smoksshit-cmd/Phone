@@ -1,6 +1,5 @@
 /* ════════════════════════════════════════════════════════════════
-   Black Market Shop — style.css  v1.0.0
-   Тёмная подворотня. Кровавые акценты. Янтарное золото.
+   Black Market Shop — style.css  v1.1.0
    ════════════════════════════════════════════════════════════════ */
 
 /* ── FAB ──────────────────────────────────────────────────────────── */
@@ -139,6 +138,7 @@
   background: linear-gradient(135deg, #1a0808, #140505);
   border-bottom: 1px solid rgba(160,20,20,0.3);
   flex-shrink: 0;
+  position: relative;
 }
 
 .bms-modal-title {
@@ -168,6 +168,8 @@
   display: flex;
   align-items: center;
   gap: 10px;
+  position: relative;
+  z-index: 2;
 }
 
 .bms-balance-pill {
@@ -181,24 +183,32 @@
   white-space: nowrap;
 }
 
+/* ── FIX: кнопка закрытия — высокий z-index и pointer-events ──────── */
 .bms-modal-close {
-  width: 28px; height: 28px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
-  border: 1px solid rgba(255,255,255,0.1);
-  background: rgba(255,255,255,0.04);
-  color: rgba(255,255,255,0.45);
+  border: 1px solid rgba(255,255,255,0.15);
+  background: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.6);
   cursor: pointer;
-  font-size: 14px;
-  display: flex; align-items: center; justify-content: center;
-  transition: background 0.15s, color 0.15s;
+  font-size: 15px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
   position: relative;
-  z-index: 2;
+  z-index: 100;
   flex-shrink: 0;
+  pointer-events: all !important;
+  -webkit-tap-highlight-color: rgba(200,40,40,0.3);
 }
 
-.bms-modal-close:hover {
-  background: rgba(200,40,40,0.3);
-  color: #ff7070;
+.bms-modal-close:hover,
+.bms-modal-close:active {
+  background: rgba(200,40,40,0.4);
+  color: #ff9090;
+  border-color: rgba(220,50,50,0.6);
 }
 
 /* Tabs */
@@ -630,10 +640,38 @@
 /* ── Addictions tab ───────────────────────────────────────────────── */
 
 .bms-add-wrap {
-  padding: 12px 14px 16px;
+  padding: 10px 12px 16px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 10px;
+}
+
+/* ── Секции бота и игрока ─────────────────────────────────────────── */
+.bms-add-section {
+  border: 1px solid rgba(160,20,20,0.15);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.bms-add-section-title {
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 700;
+  color: rgba(200,150,150,0.8);
+  background: rgba(160,20,20,0.1);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border-bottom: 1px solid rgba(160,20,20,0.15);
+}
+
+.bms-add-section .bms-add-row {
+  border: none;
+  border-bottom: 1px solid rgba(160,20,20,0.08);
+  border-radius: 0;
+}
+
+.bms-add-section .bms-add-row:last-child {
+  border-bottom: none;
 }
 
 .bms-add-row {
@@ -930,7 +968,7 @@
   font-size: 13px;
 }
 
-/* ── Mobile optimisation ──────────────────────────────────────────── */
+/* ── Mobile ───────────────────────────────────────────────────────── */
 
 @media (max-width: 520px) {
   #bms_modal {
@@ -949,13 +987,9 @@
 
   .bms-item-name { font-size: 11px; }
   .bms-item-desc { display: none; }
-
-  .bms-inv-desc { display: none; }
-
+  .bms-inv-desc  { display: none; }
   .bms-modal-title { font-size: 13px; }
-
   .bms-tab { font-size: 11px; padding: 9px 2px; }
-
   .bms-buy-btn { padding: 5px 7px; font-size: 10px; }
 
   .bms-toast {
@@ -969,7 +1003,7 @@
   .bms-items-grid { grid-template-columns: 1fr; }
 }
 
-/* ── Pull-to-close handle on mobile ──────────────────────────────── */
+/* ── Pull-to-close handle ─────────────────────────────────────────── */
 
 #bms_modal::before {
   content: '';
@@ -982,7 +1016,7 @@
   flex-shrink: 0;
 }
 
-/* ── Addon: subtle noise texture on header ────────────────────────── */
+/* ── Noise texture on header ──────────────────────────────────────── */
 
 .bms-modal-header::after {
   content: '';
@@ -992,6 +1026,5 @@
   background-size: 128px;
   pointer-events: none;
   border-radius: inherit;
+  z-index: 0;
 }
-
-.bms-modal-header { position: relative; }
