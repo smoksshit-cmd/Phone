@@ -1,2135 +1,2641 @@
 /**
- * Facts Memory Tracker (FMT) — SillyTavern Extension
- * v1.3.4
+ * Inline Image Generation Extension for SillyTavern
  *
- * Changes in v1.3.4:
- *  - exportJson: file download button + copy, no await before Popup (same fix as SRT)
- *  - importJson: file picker button + textarea, same Popup timing fix
- *  - getMessages(): filters out hidden/system messages, lorebook injections,
- *    summarise entries — only real user↔char dialogue goes to the scan prompt
+ * Catches [IMG:GEN:{json}] tags in AI messages and generates images via configured API.
+ * Supports OpenAI-compatible and Gemini-compatible (nano-banana) endpoints.
  */
 
-(() => {
-  'use strict';
+const MODULE_NAME = 'inline_image_gen';
 
-  // ─── Constants ────────────────────────────────────────────────────────────────
+// Track messages currently being processed to prevent duplicate processing
+const processingMessages = new Set();
 
-  const MODULE_KEY  = 'facts_memory_tracker';
-  const PROMPT_TAG  = 'FMT_FACTS_MEMORY';
-  const FAB_POS_KEY = 'fmt_fab_pos_v1';
-  const FAB_MARGIN  = 8;
+// Track messages that have already been fully processed to prevent re-entry after DOM changes
+const processedMessages = new Set();
 
-  const FACT_MARKER_RE      = /\[FACT:\s*([^\]|]+?)(?:\|\s*(characters|events|secrets|flashbacks))?\s*\]/gi;
-  const FLASHBACK_MARKER_RE = /\[FLASHBACK:\s*([^\]]+?)\s*\]/gi;
-  const FLASHBACK_TAG       = 'FMT_FLASHBACK_TRIGGER';
+// Log buffer for debugging
+const logBuffer = [];
+const MAX_LOG_ENTRIES = 200;
 
-  const CATEGORIES = Object.freeze({
-    characters: { label: 'Персонажи & Отношения', icon: '👤', short: 'ПЕРСОНАЖИ' },
-    events:     { label: 'События & Последствия',  icon: '📅', short: 'СОБЫТИЯ'   },
-    secrets:    { label: 'Секреты & Скрытое',       icon: '🔒', short: 'СЕКРЕТЫ'   },
-    flashbacks: { label: 'Флешбэки & Прошлое',      icon: '🌀', short: 'ФЛЕШБЭКИ'  },
-  });
-
-  const IMPORTANCE = Object.freeze({
-    high:   { label: '🔴 Высокая', color: '#e55' },
-    medium: { label: '🟡 Средняя', color: '#ca3' },
-    low:    { label: '⚪ Низкая',  color: '#888' },
-  });
-
-  const SORT_MODES = Object.freeze({
-    date:       'По дате',
-    importance: 'По важности',
-    category:   'По категории',
-  });
-
-  const EXT_PROMPT_TYPES = Object.freeze({ IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 });
-
-  const DEFAULT_PROMPT_TEMPLATE =
-    `[ПАМЯТЬ ФАКТОВ]\nКлючевые факты о мире, персонажах и событиях этого RP:\n{{facts}}\n[/ПАМЯТЬ ФАКТОВ]`;
-
-  const defaultSettings = Object.freeze({
-    enabled:          true,
-    showWidget:       true,
-    autoScan:         true,
-    autoScanEvery:    20,
-    scanDepth:        40,
-    injectImportance: 'medium',
-    maxInjectFacts:   30,
-    promptTemplate:   DEFAULT_PROMPT_TEMPLATE,
-    position:         EXT_PROMPT_TYPES.IN_PROMPT,
-    depth:            0,
-    apiEndpoint:      '',
-    apiKey:           '',
-    apiModel:         'gpt-4o-mini',
-    collapsed:        false,
-    fabScale:         0.8,
-    autoMarker:       true,
-    sortMode:         'date',
-    fallbackEnabled:  true,
-    flashEnabled:     true,
-    flashChance:      0,
-    flashCats:        ['flashbacks', 'secrets', 'characters'],
-  });
-
-  // Runtime
-  let lastFabDragTs    = 0;
-  let scanInProgress   = false;
-  let msgSinceLastScan = 0;
-  const collapsedCats  = {};
-  let searchQuery      = '';
-  let currentSortMode  = 'date';
-
-  const flashQueue   = [];
-  const flashHistory = [];
-  const MAX_FLASH_HISTORY = 10;
-
-  // ─── ST context ───────────────────────────────────────────────────────────────
-
-  function ctx() { return SillyTavern.getContext(); }
-
-  function getSettings() {
-    const { extensionSettings } = ctx();
-    if (!extensionSettings[MODULE_KEY])
-      extensionSettings[MODULE_KEY] = structuredClone(defaultSettings);
-    for (const k of Object.keys(defaultSettings))
-      if (!Object.hasOwn(extensionSettings[MODULE_KEY], k))
-        extensionSettings[MODULE_KEY][k] = defaultSettings[k];
-    return extensionSettings[MODULE_KEY];
-  }
-
-  // ─── Per-chat storage ─────────────────────────────────────────────────────────
-
-  function chatKey() {
-    const c = ctx();
-    const chatId = (typeof c.getCurrentChatId === 'function' ? c.getCurrentChatId() : null)
-      || c.chatId || c.chat_id || 'unknown';
-    const charId = c.characterId ?? c.groupId ?? 'unknown';
-    return `fmt_v1__${charId}__${chatId}`;
-  }
-
-  function findExistingStateKey(chatMetadata) {
-    const exact = chatKey();
-    if (chatMetadata[exact]?.facts?.length) return exact;
-
-    const c      = ctx();
-    const charId = String(c.characterId ?? c.groupId ?? 'unknown');
-    const prefix = `fmt_v1__${charId}__`;
-
-    let bestKey  = null;
-    let bestTime = 0;
-    for (const k of Object.keys(chatMetadata)) {
-      if (!k.startsWith(prefix)) continue;
-      const state = chatMetadata[k];
-      if (!Array.isArray(state?.facts) || !state.facts.length) continue;
-      const lastTs = state.facts.reduce((mx, f) => Math.max(mx, f.ts || 0), 0);
-      if (lastTs > bestTime) { bestTime = lastTs; bestKey = k; }
-    }
-    return bestKey;
-  }
-
-  function emptyState() {
-    return { facts: [], lastScannedMsgIndex: 0, scanLog: [] };
-  }
-
-  async function getChatState(createIfMissing = false) {
-    const { chatMetadata, saveMetadata } = ctx();
-
-    const exact = chatKey();
-    if (chatMetadata[exact]) {
-      if (!chatMetadata[exact].scanLog) chatMetadata[exact].scanLog = [];
-      return chatMetadata[exact];
-    }
-
-    const recovered = findExistingStateKey(chatMetadata);
-    if (recovered) {
-      chatMetadata[exact] = chatMetadata[recovered];
-      if (!chatMetadata[exact].scanLog) chatMetadata[exact].scanLog = [];
-      console.info(`[FMT] Факты восстановлены с ключа ${recovered} → ${exact}`);
-      setTimeout(() => toastr.success(
-        `🧠 FMT: факты восстановлены (${chatMetadata[exact].facts.length} шт.)`,
-        'Восстановление данных',
-        { timeOut: 5000 }
-      ), 500);
-      await saveMetadata();
-      return chatMetadata[exact];
-    }
-
-    if (createIfMissing) {
-      chatMetadata[exact] = emptyState();
-      await saveMetadata();
-    } else {
-      return emptyState();
-    }
-
-    if (!chatMetadata[exact].scanLog) chatMetadata[exact].scanLog = [];
-    return chatMetadata[exact];
-  }
-
-  // ─── Utils ────────────────────────────────────────────────────────────────────
-
-  function makeId() { return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`; }
-  function clamp(v, mn, mx) { return Math.max(mn, Math.min(mx, v)); }
-  function clamp01(v) { return Math.max(0, Math.min(1, v)); }
-
-  function escHtml(s) {
-    return String(s)
-      .replaceAll('&', '&amp;').replaceAll('<', '&lt;')
-      .replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#039;');
-  }
-
-  function estimateTokens(text) { return Math.ceil((text || '').length / 4); }
-
-  function getActiveCharName() {
-    const c = ctx();
-    try {
-      if (c.characterId !== undefined && c.characters?.[c.characterId]?.name)
-        return c.characters[c.characterId].name;
-      if (c.groupId !== undefined)
-        return c.groups?.find?.(g => g.id === c.groupId)?.name ?? '{{char}}';
-    } catch {}
-    return '{{char}}';
-  }
-
-  function normText(s) {
-    return s.toLowerCase().replace(/[^\wа-яёa-z0-9\s]/gi, '').replace(/\s+/g, ' ').trim();
-  }
-
-  function similarity(a, b) {
-    const na = normText(a), nb = normText(b);
-    if (na.includes(nb) || nb.includes(na)) return 1;
-    const wa = new Set(na.split(' ').filter(w => w.length >= 3));
-    const wb = new Set(nb.split(' ').filter(w => w.length >= 3));
-    if (!wa.size && !wb.size) return na === nb ? 1 : 0;
-    let common = 0;
-    for (const w of wa) if (wb.has(w)) common++;
-    return common / Math.max(wa.size, wb.size);
-  }
-
-  // ─── Download helper ──────────────────────────────────────────────────────────
-
-  function downloadJson(filename, obj) {
-    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href     = url;
-    a.download = filename;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 2000);
-  }
-
-  // ─── Chat helpers ─────────────────────────────────────────────────────────────
-
-  /**
-   * Returns the last `count` REAL dialogue messages starting from `from`.
-   *
-   * Filtered OUT (never go to scan prompt):
-   *  - is_system === true           → system / hidden messages inserted by ST
-   *  - extra.type === 'summarize'   → built-in ST summarization entries
-   *  - extra.isSmallSys             → small system injections
-   *  - extra.isHidden               → hidden messages (e.g. deleted but kept)
-   *  - extra.type === 'narrator'    → narrator / story-mode injections
-   *  - mes starts with '<|' or '[inst' → raw instruction tokens leaking into chat
-   *  - name contains '[' and ']'    → typical lorebook/WI injected pseudomessages
-   *  - mes is empty / whitespace only
-   */
-  function isRealDialogueMessage(m) {
-    if (!m) return false;
-    // Skip system/hidden flags
-    if (m.is_system)               return false;
-    if (m.extra?.isSmallSys)       return false;
-    if (m.extra?.isHidden)         return false;
-    // Skip summarization and narrator entries
-    const eType = m.extra?.type || '';
-    if (eType === 'summarize')     return false;
-    if (eType === 'narrator')      return false;
-    if (eType === 'chat_background') return false;
-    // Skip empty messages
-    const mes = (m.mes || '').trim();
-    if (!mes)                      return false;
-    // Skip raw instruction tokens that sometimes leak
-    if (mes.startsWith('<|') || mes.startsWith('[inst')) return false;
-    // Skip lorebook/WI pseudomessages — their "name" field is typically wrapped in brackets
-    const name = (m.name || '').trim();
-    if (name.startsWith('[') && name.endsWith(']')) return false;
-    return true;
-  }
-
-  function getMessages(from, count) {
-    const { chat } = ctx();
-    if (!Array.isArray(chat) || !chat.length) return { text: '', lastIdx: 0 };
-
-    // Collect real dialogue messages in the requested range
-    const slice = chat
-      .slice(Math.max(0, from), from + count)
-      .filter(isRealDialogueMessage);
-
-    const text = slice.map(m =>
-      `${m.is_user ? '{{user}}' : (m.name || '{{char}}')}: ${(m.mes || '').trim()}`
-    ).join('\n\n');
-
-    return { text, lastIdx: from + count };
-  }
-
-  function getCharacterCard() {
-    const c = ctx();
-    try {
-      const char = c.characters?.[c.characterId];
-      if (!char) return '';
-      return [
-        char.name        ? `Имя: ${char.name}`             : '',
-        char.description ? `Описание: ${char.description}` : '',
-        char.personality ? `Личность: ${char.personality}` : '',
-        char.scenario    ? `Сценарий: ${char.scenario}`    : '',
-      ].filter(Boolean).join('\n\n');
-    } catch { return ''; }
-  }
-
-  // ─── API layer ────────────────────────────────────────────────────────────────
-
-  function getBaseUrl() {
-    return (getSettings().apiEndpoint || '').trim()
-      .replace(/\/+$/, '')
-      .replace(/\/(chat\/completions|completions)$/, '')
-      .replace(/\/v1$/, '');
-  }
-
-  async function fetchModels() {
-    const base   = getBaseUrl();
-    const apiKey = (getSettings().apiKey || '').trim();
-    if (!base) throw new Error('Укажи Endpoint');
-
-    const headers = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
-    const candidates = [
-      `${base}/v1/models`,
-      `${base}/models`,
-      `${base}/api/models`,
-    ];
-
-    for (const url of candidates) {
-      try {
-        const resp = await fetch(url, { headers });
-        if (!resp.ok) continue;
-        const data = await resp.json();
-        const list = data.data || data.models || data.model_ids || data.available_models || [];
-        const ids  = list.map(m => {
-          if (typeof m === 'string') return m;
-          return m.id || m.name || m.model_id || null;
-        }).filter(Boolean).sort();
-        if (ids.length) return ids;
-      } catch {}
-    }
-
-    throw new Error('Список моделей недоступен. Введи модель вручную.');
-  }
-
-  async function testApiConnection() {
-    const s    = getSettings();
-    const base = getBaseUrl();
-    if (!base) throw new Error('Endpoint не задан');
-
-    const apiKey = (s.apiKey || '').trim();
-    const headers = {
-      'Content-Type': 'application/json',
-      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-    };
-
-    const bodyBuilders = [
-      (m) => ({ model: m, max_tokens: 5, temperature: 0,
-        messages: [{ role: 'system', content: 'test' }, { role: 'user', content: 'hi' }] }),
-      (m) => ({ model: m, max_tokens: 5, temperature: 0,
-        messages: [{ role: 'user', content: 'hi' }] }),
-    ];
-
-    const endpoints = [
-      `${base}/v1/chat/completions`,
-      `${base}/chat/completions`,
-      `${base}/v1/completions`,
-    ];
-
-    for (const url of endpoints) {
-      for (const builder of bodyBuilders) {
-        try {
-          const resp = await fetch(url, {
-            method: 'POST', headers,
-            body: JSON.stringify(builder(s.apiModel || 'gpt-4o-mini')),
-          });
-          if (resp.ok) {
-            const data = await resp.json();
-            const text = data.choices?.[0]?.message?.content
-              ?? data.choices?.[0]?.text
-              ?? data.response
-              ?? data.content;
-            if (text !== undefined) return { url, builder };
-          }
-        } catch {}
-      }
-    }
-    throw new Error('Ни один из эндпоинтов не ответил корректно');
-  }
-
-  let _workingApiConfig = null;
-
-  async function aiGenerate(userPrompt, systemPrompt) {
-    const s    = getSettings();
-    const base = getBaseUrl();
-
-    // ── Path 1: custom API (optional) ────────────────────────────────────────
-    if (base) {
-      const apiKey = (s.apiKey || '').trim();
-      const headers = {
-        'Content-Type': 'application/json',
-        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-      };
-
-      if (_workingApiConfig?.base === base) {
-        try {
-          const result = await callApiWithConfig(_workingApiConfig, userPrompt, systemPrompt, headers);
-          if (result?.trim()) return result;
-        } catch {}
-        _workingApiConfig = null;
-      }
-
-      const endpoints = [
-        `${base}/v1/chat/completions`,
-        `${base}/chat/completions`,
-        `${base}/v1/completions`,
-        `${base}/completions`,
-      ];
-      const bodyBuilders = [
-        (m) => ({ model: m, max_tokens: 1024, temperature: 0.1,
-          messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }] }),
-        (m) => ({ model: m, max_tokens: 1024, temperature: 0.1,
-          messages: [{ role: 'user', content: `${systemPrompt}\n\n---\n\n${userPrompt}` }] }),
-        (m) => ({ model: m, max_tokens: 1024, temperature: 0.1,
-          prompt: `${systemPrompt}\n\n${userPrompt}` }),
-      ];
-
-      const model = s.apiModel || 'gpt-4o-mini';
-      const errors = [];
-
-      for (const url of endpoints) {
-        for (const builder of bodyBuilders) {
-          try {
-            const resp = await fetch(url, {
-              method: 'POST', headers, body: JSON.stringify(builder(model)),
-            });
-            if (!resp.ok) { errors.push(`HTTP ${resp.status} @ ${url}`); continue; }
-            const data = await resp.json();
-            const text = extractTextFromResponse(data);
-            if (text?.trim()) {
-              _workingApiConfig = { base, url, builder };
-              return text;
+function iigLog(level, ...args) {
+    const timestamp = new Date().toISOString();
+    const message = args.map(a => {
+        if (typeof a === 'object') {
+            try {
+                return JSON.stringify(a);
+            } catch (e) {
+                return String(a);
             }
-          } catch (e) {
-            errors.push(`${e.message} @ ${url}`);
-          }
         }
-      }
+        return String(a);
+    }).join(' ');
+    const entry = `[${timestamp}] [${level}] ${message}`;
 
-      const errSummary = errors.slice(-2).join(' | ');
-      if (s.fallbackEnabled === false) {
-        throw new Error(`Кастовый API не ответил: ${errSummary}`);
-      }
-      console.warn(`[FMT] Кастовый API не ответил (${errSummary}) — используем ST`);
-      toastr.warning('[FMT] Кастовый API недоступен — используется ST', '', { timeOut: 3000 });
+    logBuffer.push(entry);
+    if (logBuffer.length > MAX_LOG_ENTRIES) {
+        logBuffer.shift();
     }
 
-    // ── Path 2: ST generateRaw ────────────────────────────────────────────────
-    const c = ctx();
-    if (typeof c.generateRaw !== 'function') {
-      throw new Error(
-        'generateRaw недоступен в этой версии ST. ' +
-        'Убедись что ST обновлён, или настрой кастовый API в разделе 🔌 API настроек FMT.'
-      );
-    }
-
-    let result;
-    try {
-      result = await c.generateRaw(
-        userPrompt,
-        null,
-        false,
-        true,       // quietToChat = TRUE — ошибки не показываются в чате
-        systemPrompt,
-        true
-      );
-    } catch (e) {
-      throw new Error(
-        `Ошибка генерации через ST: ${e.message}. ` +
-        'Проверь: 1) подключена ли модель в Chat Completion, 2) нет ли активного RP-чата который мешает.'
-      );
-    }
-
-    if (!result?.trim()) {
-      throw new Error(
-        'Модель вернула пустой ответ. Возможные причины: ' +
-        '1) модель не подключена в ST, ' +
-        '2) контекст слишком большой — уменьши «Глубину» в настройках сканирования, ' +
-        '3) модель не умеет возвращать чистый JSON — подключи кастовый API с GPT-4o или аналогом.'
-      );
-    }
-
-    return result;
-  }
-
-  async function callApiWithConfig(cfg, userPrompt, systemPrompt, headers) {
-    const s = getSettings();
-    const resp = await fetch(cfg.url, {
-      method: 'POST', headers,
-      body: JSON.stringify(cfg.builder(s.apiModel || 'gpt-4o-mini')),
-    });
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    return extractTextFromResponse(data);
-  }
-
-  function extractTextFromResponse(data) {
-    if (data.choices?.[0]?.message?.content !== undefined)
-      return data.choices[0].message.content;
-    if (data.choices?.[0]?.text !== undefined)
-      return data.choices[0].text;
-    if (typeof data.response === 'string') return data.response;
-    if (typeof data.content  === 'string') return data.content;
-    if (typeof data.text     === 'string') return data.text;
-    if (data.message?.content !== undefined) return data.message.content;
-    return null;
-  }
-
-  // ─── Extraction ───────────────────────────────────────────────────────────────
-
-  function buildSystemPrompt(existingFacts) {
-    const existing = existingFacts.length
-      ? `\nСУЩЕСТВУЮЩИЕ ФАКТЫ — НЕ ДУБЛИРОВАТЬ:\n${existingFacts.map(f => `- [${f.category}] ${f.text}`).join('\n')}\n`
-      : '';
-    return `Ты — аналитик RP-диалогов. Извлекай важные факты из переписки.
-
-ЧТО ЯВЛЯЕТСЯ ФАКТОМ: имена/роли/черты персонажей, отношения, события с последствиями, скрытые мотивы, секреты, компромат, решения.
-ЧТО НЕ ЯВЛЯЕТСЯ: атмосфера без сюжетного значения, действия без последствий, общие эмоции.
-
-КАТЕГОРИИ:
-- characters — персонажи, отношения, внешность, черты характера, прошлое
-- events     — произошедшие события, решения, последствия
-- secrets    — тайны, скрытые мотивы, компромат
-- flashbacks — воспоминания персонажа из прошлого: когда {{char}} вспоминает что-то, видит образы, упоминает давние события или травмы. Это ОТДЕЛЬНАЯ категория — не путай с events.
-
-ВАЖНОСТЬ: high (ключевой) | medium (полезный контекст) | low (второстепенный)
-Текст факта: до 15 слов, третье лицо.
-Верни ТОЛЬКО валидный JSON-массив без преамбулы и markdown:
-[{"category":"characters|events|secrets|flashbacks","text":"факт","importance":"high|medium|low"}]
-Если нет новых фактов — верни [].${existing}`;
-  }
-
-  function parseFactsJson(raw) {
-    if (!raw) return null;
-
-    const clean = raw.replace(/```json|```/gi, '').trim();
-    try {
-      const p = JSON.parse(clean);
-      if (Array.isArray(p)) return p;
-    } catch {}
-
-    const match = raw.match(/\[[\s\S]*?\]/);
-    if (match) {
-      try {
-        const p = JSON.parse(match[0]);
-        if (Array.isArray(p)) return p;
-      } catch {}
-    }
-
-    const matchMulti = raw.match(/\[[\s\S]+\]/);
-    if (matchMulti) {
-      try {
-        const p = JSON.parse(matchMulti[0]);
-        if (Array.isArray(p)) return p;
-      } catch {}
-    }
-
-    return null;
-  }
-
-  async function extractFacts(fromIdx, toIdx) {
-    const state = await getChatState(true);
-    const { text } = getMessages(fromIdx, toIdx - fromIdx);
-    if (!text.trim()) return 0;
-
-    const charCard = getCharacterCard();
-    const system   = buildSystemPrompt(state.facts);
-    const user     = `${charCard ? `КАРТОЧКА ПЕРСОНАЖА:\n${charCard}\n\n` : ''}━━━ СООБЩЕНИЯ ━━━\n${text}\n\nИзвлеки новые факты. Верни JSON-массив.`;
-
-    const raw   = await aiGenerate(user, system);
-    if (!raw) return 0;
-
-    const parsed = parseFactsJson(raw);
-    if (!parsed) {
-      const preview = raw.slice(0, 200).replace(/\n/g, ' ');
-      console.warn(`[FMT] Модель вернула не-JSON: «${preview}»`);
-      throw new Error(
-        `Модель вернула ответ не в формате JSON. Первые символы: «${raw.slice(0, 80)}». ` +
-        'Попробуй другую модель или кастовый API с более умной моделью (GPT-4o, Claude и т.д.)'
-      );
-    }
-
-    const SIM_THRESHOLD = 0.40;
-    const pool = state.facts.map(f => f.text);
-    let added  = 0;
-
-    for (const item of parsed) {
-      if (!item.text || !item.category || !(item.category in CATEGORIES)) continue;
-      if (!item.importance || !(item.importance in IMPORTANCE)) item.importance = 'medium';
-      if (pool.some(ex => similarity(ex, item.text) >= SIM_THRESHOLD)) continue;
-      state.facts.unshift({
-        id: makeId(), category: item.category, text: item.text.trim(),
-        importance: item.importance, msgIdx: toIdx, ts: Date.now(),
-      });
-      pool.push(item.text);
-      added++;
-    }
-    state.lastScannedMsgIndex = toIdx;
-    return added;
-  }
-
-  // ─── Auto-marker ──────────────────────────────────────────────────────────────
-
-  async function detectFactMarkers(messageText) {
-    const s = getSettings();
-    if (!s.autoMarker || !messageText) return;
-    const matches = [...messageText.matchAll(FACT_MARKER_RE)];
-    if (!matches.length) return;
-
-    const state = await getChatState(true);
-    const pool  = state.facts.map(f => f.text);
-    const SIM   = 0.40;
-    let changed = false;
-
-    for (const m of matches) {
-      const text = m[1].trim();
-      const cat  = (m[2] in CATEGORIES) ? m[2] : 'events';
-      if (!text || pool.some(ex => similarity(ex, text) >= SIM)) continue;
-      state.facts.unshift({ id: makeId(), category: cat, text, importance: 'medium', msgIdx: 0, ts: Date.now() });
-      pool.push(text);
-      changed = true;
-      toastr.info(`🧠 Новый факт: «${text}»`, 'FMT Авто-маркер', { timeOut: 4000 });
-    }
-
-    if (changed) {
-      await ctx().saveMetadata();
-      await updateInjectedPrompt();
-      await renderWidget();
-      if ($('#fmt_drawer').hasClass('fmt-open')) await renderDrawer();
-    }
-  }
-
-  async function detectFlashbackMarkers(messageText) {
-    const s = getSettings();
-    if (!s.autoMarker || !messageText) return;
-    const matches = [...messageText.matchAll(FLASHBACK_MARKER_RE)];
-    if (!matches.length) return;
-
-    const state = await getChatState(true);
-    const pool  = state.facts.map(f => f.text);
-    const SIM   = 0.40;
-    let changed = false;
-
-    for (const m of matches) {
-      const text = m[1].trim();
-      if (!text || pool.some(ex => similarity(ex, text) >= SIM)) continue;
-      state.facts.unshift({
-        id: makeId(), category: 'flashbacks', text,
-        importance: 'medium', msgIdx: 0, ts: Date.now(),
-      });
-      pool.push(text);
-      changed = true;
-      toastr.info(`🌀 Флешбэк: «${text}»`, 'FMT Флешбэк', { timeOut: 5000 });
-    }
-
-    if (changed) {
-      await ctx().saveMetadata();
-      await updateInjectedPrompt();
-      await renderWidget();
-      if ($('#fmt_drawer').hasClass('fmt-open')) await renderDrawer();
-    }
-  }
-
-  async function runScan(mode = 'manual') {
-    if (scanInProgress) { toastr.warning('[FMT] Сканирование уже идёт…'); return; }
-
-    const settings = getSettings();
-
-    const c    = ctx();
-    const chat = c.chat ?? c.getChat?.() ?? [];
-    if (!Array.isArray(chat) || !chat.length) {
-      toastr.warning('[FMT] История чата пуста или ещё не загружена. Попробуй через секунду.');
-      return;
-    }
-
-    scanInProgress = true;
-    const $btn = $('#fmt_scan_btn, #fmt_scan_settings_btn');
-    $btn.prop('disabled', true).text('⏳ Анализ…');
-
-    try {
-      const state   = await getChatState(true);
-      const fromIdx = mode === 'auto'
-        ? state.lastScannedMsgIndex
-        : Math.max(0, chat.length - settings.scanDepth);
-      const toIdx   = chat.length;
-
-      if (fromIdx >= toIdx) {
-        if (mode === 'manual') toastr.info('Новых сообщений для анализа нет', 'FMT');
-        return;
-      }
-
-      const added = await extractFacts(fromIdx, toIdx);
-      state.scanLog.unshift({ ts: Date.now(), added, from: fromIdx, to: toIdx, mode });
-      if (state.scanLog.length > 20) state.scanLog.length = 20;
-
-      await ctx().saveMetadata();
-      await updateInjectedPrompt();
-      await renderWidget();
-      if ($('#fmt_drawer').hasClass('fmt-open')) await renderDrawer();
-
-      if (mode === 'manual') {
-        if (added === 0) toastr.info('🔍 Новых фактов не найдено', 'FMT', { timeOut: 4000 });
-        else toastr.success(`✅ Извлечено: <b>${added}</b> фактов`, 'FMT', { timeOut: 5000, escapeHtml: false });
-      }
-    } catch (e) {
-      console.error('[FMT] scan failed', e);
-      toastr.error(`[FMT] Ошибка: ${e.message}`);
-    } finally {
-      scanInProgress = false;
-      $btn.prop('disabled', false).text('🔍 Сканировать');
-    }
-  }
-
-  // ─── Range scan ───────────────────────────────────────────────────────────────
-
-  async function runScanRange() {
-    const c    = ctx();
-    const chat = c.chat ?? c.getChat?.() ?? [];
-    if (!Array.isArray(chat) || !chat.length) {
-      toastr.warning('[FMT] История чата пуста или ещё не загружена.');
-      return;
-    }
-
-    const total = chat.length;
-
-    // No await — same Popup timing fix
-    c.Popup.show.text('🎯 FMT — Сканировать диапазон',
-      `<div style="font-size:13px;color:#c8deff">
-        <div style="margin-bottom:12px;opacity:.75">
-          Всего сообщений в чате: <b style="color:#90b8f8">${total}</b><br>
-          <span style="font-size:11px;opacity:.7">Нумерация с 1. Скрытые сообщения и саммари пропускаются автоматически.</span>
-        </div>
-        <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
-          <div style="display:flex;flex-direction:column;gap:4px">
-            <label style="font-size:11px;opacity:.65;text-transform:uppercase;letter-spacing:.05em">От сообщения №</label>
-            <input id="fmt_range_from" type="number" min="1" max="${total}" value="1"
-              style="width:90px;padding:7px 10px;border-radius:8px;border:1px solid rgba(100,160,255,0.3);background:rgba(5,12,25,.9);color:#d8e8ff;font-size:14px;font-weight:700;text-align:center">
-          </div>
-          <div style="font-size:20px;opacity:.4;padding-top:18px">→</div>
-          <div style="display:flex;flex-direction:column;gap:4px">
-            <label style="font-size:11px;opacity:.65;text-transform:uppercase;letter-spacing:.05em">До сообщения №</label>
-            <input id="fmt_range_to" type="number" min="1" max="${total}" value="${total}"
-              style="width:90px;padding:7px 10px;border-radius:8px;border:1px solid rgba(100,160,255,0.3);background:rgba(5,12,25,.9);color:#d8e8ff;font-size:14px;font-weight:700;text-align:center">
-          </div>
-          <div style="display:flex;flex-direction:column;gap:4px">
-            <label style="font-size:11px;opacity:.65;text-transform:uppercase;letter-spacing:.05em">Сообщений</label>
-            <div id="fmt_range_count"
-              style="width:56px;padding:7px 10px;border-radius:8px;border:1px solid rgba(100,160,255,0.1);background:rgba(100,160,255,0.06);color:#90b8f8;font-size:14px;font-weight:700;text-align:center">
-              ${total}
-            </div>
-          </div>
-        </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-          <button class="fmt-range-preset" data-preset="last50"
-            style="padding:5px 10px;border-radius:6px;border:1px solid rgba(100,160,255,0.2);background:rgba(100,160,255,0.08);color:#90b8f8;cursor:pointer;font-size:11px">
-            Последние 50
-          </button>
-          <button class="fmt-range-preset" data-preset="last100"
-            style="padding:5px 10px;border-radius:6px;border:1px solid rgba(100,160,255,0.2);background:rgba(100,160,255,0.08);color:#90b8f8;cursor:pointer;font-size:11px">
-            Последние 100
-          </button>
-          <button class="fmt-range-preset" data-preset="all"
-            style="padding:5px 10px;border-radius:6px;border:1px solid rgba(100,160,255,0.2);background:rgba(100,160,255,0.08);color:#90b8f8;cursor:pointer;font-size:11px">
-            Весь чат
-          </button>
-          <button class="fmt-range-preset" data-preset="first50"
-            style="padding:5px 10px;border-radius:6px;border:1px solid rgba(100,160,255,0.2);background:rgba(100,160,255,0.08);color:#90b8f8;cursor:pointer;font-size:11px">
-            Первые 50
-          </button>
-        </div>
-        <button id="fmt_range_go"
-          style="width:100%;padding:10px;border-radius:8px;border:1px solid rgba(80,200,140,0.5);background:rgba(60,180,120,0.15);color:#70e8c0;cursor:pointer;font-size:13px;font-weight:700;margin-top:2px">
-          🔍 Сканировать диапазон
-        </button>
-        <div id="fmt_range_status" style="margin-top:8px;font-size:11px;min-height:14px;text-align:center"></div>
-      </div>`
-    );
-
-    setTimeout(() => {
-      const $from   = $('#fmt_range_from');
-      const $to     = $('#fmt_range_to');
-      const $count  = $('#fmt_range_count');
-      const $status = $('#fmt_range_status');
-
-      const updateCount = () => {
-        const f = parseInt($from.val()) || 1;
-        const t = parseInt($to.val())   || total;
-        const n = Math.max(0, t - f + 1);
-        $count.text(n);
-        $count.css('color', n > 0 ? '#90b8f8' : '#ff7070');
-      };
-
-      $from.on('input', updateCount);
-      $to.on('input',   updateCount);
-
-      // Preset buttons
-      document.querySelectorAll('.fmt-range-preset').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const preset = btn.getAttribute('data-preset');
-          if (preset === 'last50')  { $from.val(Math.max(1, total - 49)); $to.val(total); }
-          if (preset === 'last100') { $from.val(Math.max(1, total - 99)); $to.val(total); }
-          if (preset === 'all')     { $from.val(1); $to.val(total); }
-          if (preset === 'first50') { $from.val(1); $to.val(Math.min(total, 50)); }
-          updateCount();
-        });
-      });
-
-      document.getElementById('fmt_range_go')?.addEventListener('click', async () => {
-        const fromNum = parseInt($from.val()) || 1;
-        const toNum   = parseInt($to.val())   || total;
-
-        if (fromNum > toNum) {
-          $status.css('color', '#ff7070').text('❌ «От» не может быть больше «До»');
-          return;
-        }
-        if (fromNum < 1 || toNum > total) {
-          $status.css('color', '#ff7070').text(`❌ Допустимый диапазон: 1 – ${total}`);
-          return;
-        }
-
-        const fromIdx = fromNum - 1; // convert 1-based UI → 0-based array
-        const toIdx   = toNum;       // slice end is exclusive, so toNum is correct
-
-        if (scanInProgress) { $status.css('color', '#ca3').text('⏳ Сканирование уже идёт…'); return; }
-
-        const $goBtn = $('#fmt_range_go');
-        $goBtn.prop('disabled', true).text('⏳ Анализ…');
-        $status.css('color', 'rgba(180,200,240,.6)').text(`Сканирую сообщения ${fromNum}–${toNum}…`);
-        scanInProgress = true;
-
-        try {
-          const added = await extractFacts(fromIdx, toIdx);
-          const state = await getChatState(true);
-          state.scanLog.unshift({ ts: Date.now(), added, from: fromIdx, to: toIdx, mode: 'range' });
-          if (state.scanLog.length > 20) state.scanLog.length = 20;
-
-          await c.saveMetadata();
-          await updateInjectedPrompt();
-          await renderWidget();
-          if ($('#fmt_drawer').hasClass('fmt-open')) await renderDrawer();
-
-          if (added === 0) {
-            $status.css('color', '#888').text('Новых фактов не найдено в этом диапазоне');
-          } else {
-            $status.css('color', '#70e8c0').text(`✅ Извлечено: ${added} фактов`);
-            toastr.success(`✅ Диапазон ${fromNum}–${toNum}: <b>${added}</b> фактов`, 'FMT', { timeOut: 5000, escapeHtml: false });
-          }
-        } catch (e) {
-          $status.css('color', '#ff7070').text(`❌ ${e.message}`);
-          toastr.error(`[FMT] ${e.message}`);
-        } finally {
-          scanInProgress = false;
-          $goBtn.prop('disabled', false).text('🔍 Сканировать диапазон');
-        }
-      });
-    }, 0);
-  }
-
-  // ─── Injection ────────────────────────────────────────────────────────────────
-
-  function buildInjectedBlock(state, settings) {
-    const impOrder = { high: 2, medium: 1, low: 0 };
-    const minScore = impOrder[settings.injectImportance || 'medium'] ?? 1;
-    const maxFacts = settings.maxInjectFacts || 30;
-
-    let filtered = state.facts.filter(f => !f.disabled && (impOrder[f.importance] ?? 0) >= minScore);
-    filtered.sort((a, b) => (impOrder[b.importance] - impOrder[a.importance]) || (b.ts||0) - (a.ts||0));
-    filtered = filtered.slice(0, maxFacts);
-    if (!filtered.length) return '';
-
-    const grouped = {};
-    for (const cat of Object.keys(CATEGORIES)) grouped[cat] = [];
-    for (const f of filtered) { if (grouped[f.category]) grouped[f.category].push(f.text); }
-
-    const lines = Object.entries(CATEGORIES)
-      .map(([key, meta]) => grouped[key].length ? `${meta.icon} ${meta.short}: ${grouped[key].join(' | ')}` : null)
-      .filter(Boolean);
-
-    if (!lines.length) return '';
-    const tpl = settings.promptTemplate || DEFAULT_PROMPT_TEMPLATE;
-    return tpl.replace('{{facts}}', lines.join('\n'));
-  }
-
-  async function updateInjectedPrompt() {
-    const s = getSettings();
-    const { setExtensionPrompt } = ctx();
-    if (!s.enabled) { setExtensionPrompt(PROMPT_TAG, '', EXT_PROMPT_TYPES.IN_PROMPT, 0, true); return; }
-    const state = await getChatState();
-    setExtensionPrompt(PROMPT_TAG, buildInjectedBlock(state, s), s.position, s.depth, true);
-  }
-
-  // ─── FAB ─────────────────────────────────────────────────────────────────────
-
-  function vpW() { return window.visualViewport?.width  || window.innerWidth; }
-  function vpH() { return window.visualViewport?.height || window.innerHeight; }
-
-  function getFabSize() {
-    const scale = getSettings().fabScale ?? 0.8;
-    return { W: Math.round(52 * scale) + 22, H: Math.round(48 * scale) + 6 };
-  }
-
-  function clampFabPos(left, top) {
-    const { W, H } = getFabSize();
-    return {
-      left: clamp(left, FAB_MARGIN, Math.max(FAB_MARGIN, vpW() - W - FAB_MARGIN)),
-      top:  clamp(top,  FAB_MARGIN, Math.max(FAB_MARGIN, vpH() - H - FAB_MARGIN)),
-    };
-  }
-
-  function applyFabScale() {
-    const btn = document.getElementById('fmt_fab_btn');
-    if (!btn) return;
-    const scale = getSettings().fabScale ?? 0.8;
-    btn.style.transform       = `scale(${scale})`;
-    btn.style.transformOrigin = 'top left';
-    const fab = document.getElementById('fmt_fab');
-    if (fab) {
-      fab.style.width  = Math.round(52 * scale) + 'px';
-      fab.style.height = Math.round(48 * scale) + 'px';
-    }
-  }
-
-  function applyFabPosition() {
-    const el = document.getElementById('fmt_fab');
-    if (!el) return;
-    el.style.transform = 'none';
-    el.style.right = el.style.bottom = 'auto';
-    const { W, H } = getFabSize();
-    try {
-      const raw = localStorage.getItem(FAB_POS_KEY);
-      if (!raw) { setFabDefault(); return; }
-      const pos = JSON.parse(raw);
-      let left, top;
-      if (typeof pos.x === 'number') {
-        left = Math.round(pos.x * (vpW() - W - FAB_MARGIN * 2)) + FAB_MARGIN;
-        top  = Math.round(pos.y * (vpH() - H - FAB_MARGIN * 2)) + FAB_MARGIN;
-      } else if (typeof pos.left === 'number') {
-        left = pos.left; top = pos.top;
-      } else { setFabDefault(); return; }
-      const c = clampFabPos(left, top);
-      el.style.left = c.left + 'px';
-      el.style.top  = c.top  + 'px';
-    } catch { setFabDefault(); }
-  }
-
-  function saveFabPosPx(left, top) {
-    const { W, H } = getFabSize();
-    const c  = clampFabPos(left, top);
-    const rx = Math.max(1, vpW() - W - FAB_MARGIN * 2);
-    const ry = Math.max(1, vpH() - H - FAB_MARGIN * 2);
-    try {
-      localStorage.setItem(FAB_POS_KEY, JSON.stringify({
-        x: clamp01((c.left - FAB_MARGIN) / rx), y: clamp01((c.top - FAB_MARGIN) / ry),
-        left: c.left, top: c.top,
-      }));
-    } catch {}
-  }
-
-  function setFabDefault() {
-    const el = document.getElementById('fmt_fab');
-    if (!el) return;
-    const { W, H } = getFabSize();
-    const left = clamp(vpW() - W - FAB_MARGIN - 90, FAB_MARGIN, vpW() - W - FAB_MARGIN);
-    const top  = clamp(Math.round((vpH() - H) / 2) + 70, FAB_MARGIN, vpH() - H - FAB_MARGIN);
-    el.style.left = left + 'px'; el.style.top = top + 'px';
-    saveFabPosPx(left, top);
-  }
-
-  function ensureFab() {
-    if ($('#fmt_fab').length) return;
-    $('body').append(`
-      <div id="fmt_fab">
-        <button type="button" id="fmt_fab_btn" title="Открыть трекер фактов">
-          <div>🧠</div>
-          <div class="fmt-mini"><span id="fmt_fab_count">0</span> фактов</div>
-        </button>
-        <button type="button" id="fmt_fab_hide" title="Скрыть виджет">✕</button>
-      </div>
-    `);
-    $('#fmt_fab_btn').on('click', ev => {
-      if (Date.now() - lastFabDragTs < 350) { ev.preventDefault(); return; }
-      openDrawer(true);
-    });
-    $('#fmt_fab_hide').on('click', async () => {
-      getSettings().showWidget = false;
-      ctx().saveSettingsDebounced();
-      await renderWidget();
-      toastr.info('Виджет скрыт (включить в настройках расширения)');
-    });
-    initFabDrag();
-    applyFabPosition();
-    applyFabScale();
-  }
-
-  function initFabDrag() {
-    const fab    = document.getElementById('fmt_fab');
-    const handle = document.getElementById('fmt_fab_btn');
-    if (!fab || !handle || fab.dataset.dragInit === '1') return;
-    fab.dataset.dragInit = '1';
-
-    let sx, sy, sl, st, moved = false;
-    const THRESH = 6;
-
-    const onMove = (ev) => {
-      const dx = ev.clientX - sx, dy = ev.clientY - sy;
-      if (!moved && Math.abs(dx) + Math.abs(dy) > THRESH) { moved = true; fab.classList.add('fmt-dragging'); }
-      if (!moved) return;
-      const p = clampFabPos(sl + dx, st + dy);
-      fab.style.left = p.left + 'px'; fab.style.top = p.top + 'px';
-      fab.style.right = fab.style.bottom = 'auto';
-      ev.preventDefault(); ev.stopPropagation();
-    };
-
-    const onEnd = (ev) => {
-      try { handle.releasePointerCapture(ev.pointerId); } catch {}
-      document.removeEventListener('pointermove', onMove, { passive: false });
-      document.removeEventListener('pointerup', onEnd);
-      document.removeEventListener('pointercancel', onEnd);
-      if (moved) {
-        saveFabPosPx(parseInt(fab.style.left) || 0, parseInt(fab.style.top) || 0);
-        lastFabDragTs = Date.now();
-      }
-      moved = false; fab.classList.remove('fmt-dragging');
-    };
-
-    handle.addEventListener('pointerdown', (ev) => {
-      if (ev.pointerType === 'mouse' && ev.button !== 0) return;
-      const { W, H } = getFabSize();
-      const curL = parseInt(fab.style.left) || (vpW() - W - FAB_MARGIN - 90);
-      const curT = parseInt(fab.style.top)  || Math.round((vpH() - H) / 2);
-      const p = clampFabPos(curL, curT);
-      fab.style.left = p.left + 'px'; fab.style.top = p.top + 'px';
-      fab.style.right = fab.style.bottom = 'auto'; fab.style.transform = 'none';
-      sx = ev.clientX; sy = ev.clientY; sl = p.left; st = p.top; moved = false;
-      try { handle.setPointerCapture(ev.pointerId); } catch {}
-      document.addEventListener('pointermove', onMove, { passive: false });
-      document.addEventListener('pointerup', onEnd, { passive: true });
-      document.addEventListener('pointercancel', onEnd, { passive: true });
-      ev.preventDefault();
-    }, { passive: false });
-
-    let resizeTimer = null;
-    const onResize = () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(applyFabPosition, 200); };
-    window.addEventListener('resize', onResize);
-    window.addEventListener('orientationchange', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(applyFabPosition, 350); });
-    if (window.visualViewport) window.visualViewport.addEventListener('resize', onResize);
-  }
-
-  async function renderWidget() {
-    ensureFab();
-    applyFabPosition();
-    applyFabScale();
-    const s = getSettings();
-    if (!s.showWidget) { $('#fmt_fab').hide(); return; }
-    const state  = await getChatState();
-    const active = state.facts.filter(f => !f.disabled).length;
-    $('#fmt_fab_count').text(active);
-    $('#fmt_fab').show();
-  }
-
-  // ─── Drawer ───────────────────────────────────────────────────────────────────
-
-  function ensureDrawer() {
-    if ($('#fmt_drawer').length) return;
-    $('body').append(`
-      <aside id="fmt_drawer" aria-hidden="true">
-        <header>
-          <div class="topline">
-            <div class="title">🧠 ПАМЯТЬ ФАКТОВ</div>
-            <button type="button" id="fmt_close" style="pointer-events:auto">✕</button>
-          </div>
-          <div class="sub" id="fmt_subtitle"></div>
-          <div class="fmt-token-bar" id="fmt_token_bar"></div>
-        </header>
-
-        <div class="fmt-toolbar">
-          <input type="text" id="fmt_search" placeholder="🔍 Поиск по тексту…" autocomplete="off">
-          <select id="fmt_sort_select">
-            ${Object.entries(SORT_MODES).map(([k,v]) => `<option value="${k}">${v}</option>`).join('')}
-          </select>
-        </div>
-
-        <div class="fmt-filters">
-          <button class="fmt-filter-btn active" data-cat="all">Все</button>
-          <button class="fmt-filter-btn" data-cat="characters">👤</button>
-          <button class="fmt-filter-btn" data-cat="events">📅</button>
-          <button class="fmt-filter-btn" data-cat="secrets">🔒</button>
-          <button class="fmt-filter-btn" data-cat="flashbacks">🌀</button>
-          <span class="fmt-filter-sep">|</span>
-          <button class="fmt-filter-btn" data-imp="high">🔴</button>
-          <button class="fmt-filter-btn" data-imp="medium">🟡</button>
-          <button class="fmt-filter-btn" data-imp="low">⚪</button>
-        </div>
-
-        <div class="content" id="fmt_content"></div>
-        <div id="fmt_flash_panel" style="display:none"></div>
-
-        <div class="footer">
-          <button type="button" id="fmt_scan_btn">🔍 Сканировать</button>
-          <button type="button" id="fmt_scan_range_btn" title="Выбрать диапазон сообщений для сканирования">🎯 Диапазон</button>
-          <button type="button" id="fmt_flashback_btn" title="Случайный флешбек из фактов">⚡ Флешбек</button>
-          <button type="button" id="fmt_export_btn">📤 Экспорт</button>
-          <button type="button" id="fmt_import_btn">📥 Импорт</button>
-          <button type="button" id="fmt_show_prompt_btn">Промпт</button>
-          <button type="button" id="fmt_scanlog_btn">📋 Лог</button>
-          <button type="button" id="fmt_recover_btn" title="Найти факты под другим ключом (если слетели)">🔄 Восстановить</button>
-          <button type="button" id="fmt_clear_btn" title="Очистить все факты">🗑️</button>
-          <button type="button" id="fmt_close2" style="pointer-events:auto">Закрыть</button>
-        </div>
-      </aside>
-    `);
-
-    document.getElementById('fmt_close').addEventListener('click',  () => openDrawer(false), true);
-    document.getElementById('fmt_close2').addEventListener('click', () => openDrawer(false), true);
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && document.getElementById('fmt_drawer')?.classList.contains('fmt-open'))
-        openDrawer(false);
-    });
-
-    $(document)
-      .off('click.fmt_actions')
-      .on('click.fmt_actions', '#fmt_scan_btn',        () => runScan('manual'))
-      .on('click.fmt_actions', '#fmt_scan_range_btn',  () => runScanRange())
-      .on('click.fmt_actions', '#fmt_flashback_btn',   () => triggerFlashback())
-      .on('click.fmt_actions', '#fmt_show_prompt_btn', () => showPromptPreview())
-      .on('click.fmt_actions', '#fmt_recover_btn',     () => recoverFacts())
-      .on('click.fmt_actions', '#fmt_clear_btn',       () => clearAllFacts())
-      .on('click.fmt_actions', '#fmt_export_btn',      () => exportJson())
-      .on('click.fmt_actions', '#fmt_import_btn',      () => importJson())
-      .on('click.fmt_actions', '#fmt_scanlog_btn',     () => showScanLog());
-
-    $(document).off('click.fmt_filter').on('click.fmt_filter', '.fmt-filter-btn', function () {
-      const cat = this.getAttribute('data-cat');
-      const imp = this.getAttribute('data-imp');
-      if (cat !== null) {
-        document.querySelectorAll('.fmt-filter-btn[data-cat]').forEach(b => b.classList.remove('active'));
-        this.classList.add('active');
-      }
-      if (imp !== null) this.classList.toggle('active');
-      applyFiltersAndSearch();
-    });
-
-    $(document).off('input.fmt_search').on('input.fmt_search', '#fmt_search', function () {
-      searchQuery = this.value.toLowerCase().trim();
-      applyFiltersAndSearch();
-    });
-
-    $(document).off('change.fmt_sort').on('change.fmt_sort', '#fmt_sort_select', async function () {
-      currentSortMode = this.value;
-      getSettings().sortMode = currentSortMode;
-      ctx().saveSettingsDebounced();
-      await renderDrawer();
-    });
-  }
-
-  // ─── Filters & search ─────────────────────────────────────────────────────────
-
-  function applyFiltersAndSearch() {
-    const catEl = document.querySelector('.fmt-filter-btn[data-cat].active');
-    const cat   = catEl ? catEl.getAttribute('data-cat') : 'all';
-    const imp   = [];
-    document.querySelectorAll('.fmt-filter-btn[data-imp].active').forEach(el => imp.push(el.getAttribute('data-imp')));
-    const q = searchQuery;
-
-    document.querySelectorAll('.fmt-fact-row').forEach(el => {
-      const elCat  = el.getAttribute('data-cat');
-      const elImp  = el.getAttribute('data-imp');
-      const elText = (el.getAttribute('data-text') || '').toLowerCase();
-      const catOk  = cat === 'all' || elCat === cat;
-      const impOk  = imp.length === 0 || imp.includes(elImp);
-      const srchOk = !q || elText.includes(q);
-      el.classList.toggle('fmt-row-hidden', !(catOk && impOk && srchOk));
-    });
-
-    document.querySelectorAll('.fmt-cat-section').forEach(sec => {
-      const secCat = sec.getAttribute('data-cat');
-      const catOk  = cat === 'all' || secCat === cat;
-      const hasVis = sec.querySelectorAll('.fmt-fact-row:not(.fmt-row-hidden)').length > 0;
-      sec.classList.toggle('fmt-row-hidden', !catOk || !hasVis);
-    });
-  }
-
-  // ─── Open/close ───────────────────────────────────────────────────────────────
-
-  function openDrawer(open) {
-    ensureDrawer();
-    const drawer = document.getElementById('fmt_drawer');
-    if (!drawer) return;
-    if (open) {
-      if (!document.getElementById('fmt_overlay')) {
-        const ov = document.createElement('div');
-        ov.id = 'fmt_overlay';
-        document.body.insertBefore(ov, drawer);
-        ov.addEventListener('click', () => openDrawer(false), true);
-      }
-      document.getElementById('fmt_overlay').style.display = 'block';
-      drawer.classList.add('fmt-open');
-      drawer.setAttribute('aria-hidden', 'false');
-      renderDrawer();
-      renderFlashQueueUI();
+    if (level === 'ERROR') {
+        console.error('[IIG]', ...args);
+    } else if (level === 'WARN') {
+        console.warn('[IIG]', ...args);
     } else {
-      drawer.classList.remove('fmt-open');
-      drawer.setAttribute('aria-hidden', 'true');
-      const ov = document.getElementById('fmt_overlay');
-      if (ov) ov.style.display = 'none';
+        console.log('[IIG]', ...args);
     }
-  }
+}
 
-  function sortFacts(facts) {
-    const impOrder = { high: 2, medium: 1, low: 0 };
-    const catOrder = { characters: 0, events: 1, secrets: 2, flashbacks: 3 };
-    const mode = currentSortMode || 'date';
-    const copy = [...facts];
-    if (mode === 'importance')
-      copy.sort((a, b) => (impOrder[b.importance] - impOrder[a.importance]) || (b.ts||0) - (a.ts||0));
-    else if (mode === 'category')
-      copy.sort((a, b) => ((catOrder[a.category] ?? 99) - (catOrder[b.category] ?? 99)) || (b.ts||0) - (a.ts||0));
-    else
-      copy.sort((a, b) => (b.ts||0) - (a.ts||0));
-    return copy;
-  }
+function exportLogs() {
+    const logsText = logBuffer.join('\n');
+    const blob = new Blob([logsText], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `iig-logs-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toastr.success('Логи экспортированы', 'Генерация картинок');
+}
 
-  function renderFactRow(fact) {
-    const catMeta = CATEGORIES[fact.category] || CATEGORIES.events;
-    const impMeta = IMPORTANCE[fact.importance] || IMPORTANCE.medium;
-    const ts      = new Date(fact.ts || 0).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
-    const dis     = !!fact.disabled;
+// Default settings
+const defaultSettings = Object.freeze({
+    enabled: true,
+    apiType: 'openai',
+    endpoint: '',
+    apiKey: '',
+    model: '',
+    size: '1024x1024',
+    quality: 'standard',
+    maxRetries: 0,
+    retryDelay: 1000,
+    sendCharAvatar: false,
+    sendUserAvatar: false,
+    sendPreviousImage: false,
+    userAvatarFile: '',
+    userCharacterName: '',
+    defaultStyle: '',
+    aspectRatio: '1:1',
+    imageSize: '1K',
+    npcReferences: [],
+    styleReferenceImages: [],
+    sendStyleReference: false,
+    apiPresets: [],
+});
 
-    const catOpts = Object.entries(CATEGORIES)
-      .map(([k,v]) => `<option value="${k}" ${k===fact.category?'selected':''}>${v.icon}</option>`).join('');
-    const impOpts = Object.entries(IMPORTANCE)
-      .map(([k,v]) => `<option value="${k}" ${k===fact.importance?'selected':''}>${v.label}</option>`).join('');
+const IMAGE_MODEL_KEYWORDS = [
+    'dall-e', 'midjourney', 'mj', 'journey', 'stable-diffusion', 'sdxl', 'flux',
+    'imagen', 'drawing', 'paint', 'image', 'seedream', 'hidream', 'dreamshaper',
+    'ideogram', 'nano-banana', 'gpt-image', 'wanx', 'qwen'
+];
 
-    return `
-      <div class="fmt-fact-row${dis ? ' fmt-fact-disabled' : ''}"
-           data-id="${fact.id}" data-cat="${fact.category}" data-imp="${fact.importance}"
-           data-text="${escHtml(fact.text.toLowerCase())}">
-        <select class="fmt-inline-cat" data-id="${fact.id}" title="Изменить категорию">${catOpts}</select>
-        <span class="fmt-imp-dot" style="background:${impMeta.color}" title="${escHtml(impMeta.label)}"></span>
-        <span class="fmt-fact-text" data-id="${fact.id}" title="Кликни для редактирования">${escHtml(fact.text)}</span>
-        <span class="fmt-fact-date">${ts}</span>
-        <select class="fmt-inline-imp" data-id="${fact.id}" title="Изменить важность">${impOpts}</select>
-        <button class="fmt-flash-btn" data-id="${fact.id}" title="Использовать этот факт как флешбек">⚡</button>
-        <button class="fmt-toggle-btn" data-id="${fact.id}" title="${dis ? 'Включить' : 'Отключить'}">${dis ? '▶' : '⏸'}</button>
-        <button class="fmt-delete-btn" data-id="${fact.id}" title="Удалить">✕</button>
-      </div>`;
-  }
+const VIDEO_MODEL_KEYWORDS = [
+    'sora', 'kling', 'jimeng', 'veo', 'pika', 'runway', 'luma',
+    'video', 'gen-3', 'minimax', 'cogvideo', 'mochi', 'seedance',
+    'vidu', 'wan-ai', 'hunyuan', 'hailuo'
+];
 
-  async function renderDrawer() {
-    ensureDrawer();
-    const state    = await getChatState();
+function isImageModel(modelId) {
+    const mid = modelId.toLowerCase();
+    for (const kw of VIDEO_MODEL_KEYWORDS) {
+        if (mid.includes(kw)) return false;
+    }
+    if (mid.includes('vision') && mid.includes('preview')) return false;
+    for (const kw of IMAGE_MODEL_KEYWORDS) {
+        if (mid.includes(kw)) return true;
+    }
+    return false;
+}
+
+function isGeminiModel(modelId) {
+    const mid = modelId.toLowerCase();
+    return mid.includes('nano-banana');
+}
+
+function getSettings() {
+    const context = SillyTavern.getContext();
+    if (!context.extensionSettings[MODULE_NAME]) {
+        context.extensionSettings[MODULE_NAME] = structuredClone(defaultSettings);
+    }
+    for (const key of Object.keys(defaultSettings)) {
+        if (!Object.hasOwn(context.extensionSettings[MODULE_NAME], key)) {
+            context.extensionSettings[MODULE_NAME][key] = defaultSettings[key];
+        }
+    }
+    return context.extensionSettings[MODULE_NAME];
+}
+
+function saveSettings() {
+    const context = SillyTavern.getContext();
+    context.saveSettingsDebounced();
+}
+
+async function fetchModels() {
     const settings = getSettings();
-    const charName = getActiveCharName();
-    const total    = state.facts.length;
-    const active   = state.facts.filter(f => !f.disabled).length;
+    if (!settings.endpoint || !settings.apiKey) {
+        console.warn('[IIG] Cannot fetch models: endpoint or API key not set');
+        return [];
+    }
+    const baseUrl = settings.endpoint.replace(/\/$/, '');
+    const isGemini = settings.apiType === 'gemini' || baseUrl.includes('googleapis.com');
 
-    $('#fmt_subtitle').text(`${charName} · ${total} фактов · ${active} активных`);
-
-    const block  = buildInjectedBlock(state, settings);
-    const tokens = estimateTokens(block);
-    const maxF   = settings.maxInjectFacts || 30;
-    $('#fmt_token_bar').html(
-      block
-        ? `<span class="fmt-tok-label">Инъекция: ~<b>${tokens}</b> токенов · ${active}/${maxF} фактов</span>`
-        : `<span class="fmt-tok-label fmt-tok-empty">Инъекция пуста — нет активных фактов выше порога</span>`
-    );
-
-    currentSortMode = settings.sortMode || 'date';
-    const $sortSel = $('#fmt_sort_select');
-    if ($sortSel.length) $sortSel.val(currentSortMode);
-
-    const sorted  = sortFacts(state.facts);
-    const grouped = {};
-    for (const cat of Object.keys(CATEGORIES)) grouped[cat] = [];
-    for (const f of sorted) { if (grouped[f.category]) grouped[f.category].push(f); }
-
-    let html = `
-      <div class="fmt-add-block">
-        <input type="text" id="fmt_add_text" placeholder="Добавить факт вручную…" maxlength="120">
-        <select id="fmt_add_cat">
-          ${Object.entries(CATEGORIES).map(([k,v]) => `<option value="${k}">${v.icon} ${v.label}</option>`).join('')}
-        </select>
-        <select id="fmt_add_imp">
-          ${Object.entries(IMPORTANCE).map(([k,v]) => `<option value="${k}">${v.label}</option>`).join('')}
-        </select>
-        <button id="fmt_add_btn">+ Добавить</button>
-      </div>`;
-
-    if (total === 0) {
-      html += `<div class="fmt-empty">Фактов нет. Нажмите <b>🔍 Сканировать</b> — AI извлечёт важное из истории.</div>`;
+    let url, fetchOptions;
+    if (isGemini) {
+        url = `${baseUrl}/v1beta/models?key=${settings.apiKey}`;
+        fetchOptions = { method: 'GET' };
     } else {
-      for (const [cat, meta] of Object.entries(CATEGORIES)) {
-        const items = grouped[cat];
-        if (!items.length) continue;
-        const isColl    = !!collapsedCats[cat];
-        const disabledN = items.filter(f => f.disabled).length;
-        html += `
-          <div class="fmt-cat-section" data-cat="${cat}">
-            <div class="fmt-cat-header" data-collapse-cat="${cat}">
-              <span class="fmt-cat-chevron">${isColl ? '▸' : '▾'}</span>
-              ${meta.icon} ${meta.label}
-              <span class="fmt-cat-count">${items.length}${disabledN ? ` <span class="fmt-cat-dis">${disabledN} откл.</span>` : ''}</span>
-            </div>
-            <div class="fmt-cat-body${isColl ? ' fmt-cat-collapsed' : ''}">
-              ${items.map(f => renderFactRow(f)).join('')}
-            </div>
-          </div>`;
-      }
-    }
-
-    $('#fmt_content').html(html);
-
-    $('#fmt_add_btn').on('click', addFactManual);
-    $('#fmt_add_text').on('keydown', e => { if (e.key === 'Enter') addFactManual(); });
-
-    $(document).off('click.fmt_collapse').on('click.fmt_collapse', '.fmt-cat-header', function () {
-      const cat = this.getAttribute('data-collapse-cat');
-      if (!cat) return;
-      collapsedCats[cat] = !collapsedCats[cat];
-      $(this).next('.fmt-cat-body').toggleClass('fmt-cat-collapsed', collapsedCats[cat]);
-      $(this).find('.fmt-cat-chevron').text(collapsedCats[cat] ? '▸' : '▾');
-    });
-
-    $(document).off('click.fmt_edit').on('click.fmt_edit', '.fmt-fact-text', function () {
-      const id  = this.getAttribute('data-id');
-      const cur = this.textContent;
-      const inp = document.createElement('input');
-      inp.type = 'text'; inp.value = cur; inp.className = 'fmt-edit-input'; inp.maxLength = 120;
-      $(this).replaceWith(inp);
-      inp.focus(); inp.select();
-      const save = async () => {
-        const newText = inp.value.trim();
-        if (newText && newText !== cur) await updateFactField(id, 'text', newText);
-        else await renderDrawer();
-      };
-      inp.addEventListener('blur', save);
-      inp.addEventListener('keydown', e => {
-        if (e.key === 'Enter') { e.preventDefault(); inp.blur(); }
-        if (e.key === 'Escape') { inp.value = cur; inp.blur(); }
-      });
-    });
-
-    $(document).off('change.fmt_inlinecat').on('change.fmt_inlinecat', '.fmt-inline-cat', async function () {
-      await updateFactField(this.getAttribute('data-id'), 'category', this.value);
-    });
-    $(document).off('change.fmt_inlineimp').on('change.fmt_inlineimp', '.fmt-inline-imp', async function () {
-      await updateFactField(this.getAttribute('data-id'), 'importance', this.value);
-    });
-
-    $(document).off('click.fmt_flash_row').on('click.fmt_flash_row', '.fmt-flash-btn', async function (e) {
-      e.stopPropagation();
-      await triggerFlashback(this.getAttribute('data-id'));
-    });
-
-    $(document).off('click.fmt_toggle').on('click.fmt_toggle', '.fmt-toggle-btn', async function (e) {
-      e.stopPropagation();
-      await toggleDisableFact(this.getAttribute('data-id'));
-    });
-
-    $(document).off('click.fmt_delete').on('click.fmt_delete', '.fmt-delete-btn', async function (e) {
-      e.stopPropagation();
-      await deleteFact(this.getAttribute('data-id'));
-    });
-
-    applyFiltersAndSearch();
-  }
-
-  // ─── CRUD ─────────────────────────────────────────────────────────────────────
-
-  async function addFactManual() {
-    const text       = String($('#fmt_add_text').val() ?? '').trim();
-    const category   = String($('#fmt_add_cat').val() ?? 'events');
-    const importance = String($('#fmt_add_imp').val() ?? 'medium');
-    if (!text) { toastr.warning('Введите текст факта'); return; }
-    const state = await getChatState(true);
-    state.facts.unshift({ id: makeId(), category, text, importance, msgIdx: 0, ts: Date.now() });
-    $('#fmt_add_text').val('');
-    await ctx().saveMetadata();
-    await updateInjectedPrompt();
-    await renderDrawer();
-    await renderWidget();
-  }
-
-  async function updateFactField(id, field, value) {
-    const state = await getChatState(true);
-    const fact  = state.facts.find(f => f.id === id);
-    if (!fact) return;
-    fact[field] = value;
-    await ctx().saveMetadata();
-    await updateInjectedPrompt();
-    await renderDrawer();
-  }
-
-  async function toggleDisableFact(id) {
-    const state = await getChatState(true);
-    const fact  = state.facts.find(f => f.id === id);
-    if (!fact) return;
-    fact.disabled = !fact.disabled;
-    const row = document.querySelector(`.fmt-fact-row[data-id="${id}"]`);
-    if (row) {
-      row.classList.toggle('fmt-fact-disabled', fact.disabled);
-      const btn = row.querySelector('.fmt-toggle-btn');
-      if (btn) { btn.textContent = fact.disabled ? '▶' : '⏸'; btn.title = fact.disabled ? 'Включить' : 'Отключить'; }
-    }
-    await ctx().saveMetadata();
-    await updateInjectedPrompt();
-    await renderWidget();
-    const block  = buildInjectedBlock(state, getSettings());
-    const tokens = estimateTokens(block);
-    const maxF   = getSettings().maxInjectFacts || 30;
-    const active = state.facts.filter(f => !f.disabled).length;
-    $('#fmt_token_bar').html(
-      block
-        ? `<span class="fmt-tok-label">Инъекция: ~<b>${tokens}</b> токенов · ${active}/${maxF} фактов</span>`
-        : `<span class="fmt-tok-label fmt-tok-empty">Инъекция пуста</span>`
-    );
-  }
-
-  async function deleteFact(id) {
-    const state = await getChatState(true);
-    const idx   = state.facts.findIndex(f => f.id === id);
-    if (idx >= 0) state.facts.splice(idx, 1);
-    await ctx().saveMetadata();
-    await updateInjectedPrompt();
-    await renderDrawer();
-    await renderWidget();
-  }
-
-  async function recoverFacts() {
-    const { chatMetadata, saveMetadata } = ctx();
-    const exact  = chatKey();
-    const c      = ctx();
-    const charId = String(c.characterId ?? c.groupId ?? 'unknown');
-    const prefix = `fmt_v1__${charId}__`;
-
-    const candidates = Object.keys(chatMetadata)
-      .filter(k => k.startsWith(prefix) && Array.isArray(chatMetadata[k]?.facts) && chatMetadata[k].facts.length)
-      .sort((a, b) => {
-        const ta = chatMetadata[a].facts.reduce((mx, f) => Math.max(mx, f.ts || 0), 0);
-        const tb = chatMetadata[b].facts.reduce((mx, f) => Math.max(mx, f.ts || 0), 0);
-        return tb - ta;
-      });
-
-    if (!candidates.length) {
-      toastr.warning('[FMT] Сохранённых фактов для этого персонажа не найдено ни под одним ключом');
-      return;
-    }
-
-    const bestKey   = candidates[0];
-    const bestState = chatMetadata[bestKey];
-    const n         = bestState.facts.length;
-
-    if (bestKey === exact) {
-      toastr.info(`[FMT] Данные уже актуальны (${n} фактов)`);
-      return;
-    }
-
-    chatMetadata[exact] = bestState;
-    await saveMetadata();
-    await updateInjectedPrompt();
-    await renderDrawer();
-    await renderWidget();
-    toastr.success(`✅ Восстановлено ${n} фактов!`, 'FMT', { timeOut: 5000 });
-  }
-
-  async function clearAllFacts() {
-    const { Popup } = ctx();
-    const ok = await Popup.show.confirm('Очистить все факты?', 'Действие нельзя отменить.');
-    if (!ok) return;
-    const state = await getChatState(true);
-    state.facts = []; state.lastScannedMsgIndex = 0;
-    await ctx().saveMetadata();
-    await updateInjectedPrompt();
-    await renderDrawer();
-    await renderWidget();
-    toastr.success('Все факты удалены');
-  }
-
-  // ─── Export ───────────────────────────────────────────────────────────────────
-  // BUG FIX (same as SRT): removed `await` before Popup.show.text() —
-  // the promise resolves when popup is CLOSED, so handlers must be attached
-  // via setTimeout(0) after the popup renders, not after await.
-
-  async function exportJson() {
-    const state    = await getChatState();
-    const charName = getActiveCharName();
-    const ts       = new Date().toISOString().slice(0, 19).replace('T', '_').replace(/:/g, '-');
-    const filename = `fmt_${charName.replace(/[^a-zа-яёA-ZА-ЯЁ0-9]/gi, '_').slice(0, 30)}_${ts}.json`;
-    const json     = JSON.stringify(state, null, 2);
-    const total    = state.facts.length;
-
-    // ← NO await: promise resolves on popup close, not open
-    ctx().Popup.show.text('📤 FMT — Экспорт фактов',
-      `<div style="font-family:Consolas,monospace;font-size:12px">
-        <div style="margin-bottom:10px;opacity:.8">
-          Персонаж: <b>${escHtml(charName)}</b> · Фактов всего: <b>${total}</b>
-        </div>
-        <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
-          <button id="fmt_export_download"
-            style="padding:8px 14px;background:rgba(80,180,140,0.15);border:1px solid rgba(80,180,140,0.5);color:#70e8c0;border-radius:8px;cursor:pointer;font-size:13px">
-            ⬇️ Скачать файл
-          </button>
-          <button id="fmt_export_copy"
-            style="padding:8px 14px;background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.2);color:#c8deff;border-radius:8px;cursor:pointer;font-size:13px">
-            📋 Скопировать JSON
-          </button>
-        </div>
-        <pre style="white-space:pre-wrap;max-height:50vh;overflow:auto;background:rgba(5,12,25,0.85);color:#c8deff;padding:10px;border-radius:8px;font-size:11px">${escHtml(json)}</pre>
-      </div>`
-    );
-
-    // Give the browser one tick to render popup DOM before attaching handlers
-    setTimeout(() => {
-      document.getElementById('fmt_export_download')?.addEventListener('click', () => {
-        downloadJson(filename, state);
-        toastr.success(`Файл "${filename}" сохранён`);
-      });
-      document.getElementById('fmt_export_copy')?.addEventListener('click', () => {
-        navigator.clipboard?.writeText(json).then(
-          () => toastr.success('JSON скопирован в буфер обмена'),
-          () => toastr.error('Не удалось скопировать — выдели текст вручную')
-        );
-      });
-    }, 0);
-  }
-
-  // ─── Import ───────────────────────────────────────────────────────────────────
-  // Same fix: no await before Popup, handlers via setTimeout(0)
-
-  async function importJson() {
-    // ← NO await
-    ctx().Popup.show.text('📥 FMT — Импорт фактов',
-      `<div style="font-family:Consolas,monospace;font-size:12px">
-        <div style="margin-bottom:10px;font-weight:700;opacity:.9">Загрузить из файла или вставить JSON:</div>
-        <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
-          <button id="fmt_import_file_btn"
-            style="padding:8px 14px;background:rgba(52,152,219,0.15);border:1px solid rgba(52,152,219,0.5);color:#5dade2;border-radius:8px;cursor:pointer;font-size:13px">
-            📁 Выбрать файл (.json)
-          </button>
-        </div>
-        <input type="file" id="fmt_import_file_input" accept=".json,application/json" style="display:none">
-        <textarea id="fmt_import_textarea"
-          placeholder="…или вставь JSON сюда вручную (экспорт из FMT)"
-          style="width:100%;height:140px;background:rgba(5,12,25,0.85);border:1px solid rgba(100,160,255,0.2);color:#c8deff;border-radius:8px;padding:8px;font-family:Consolas,monospace;font-size:11px;resize:vertical;box-sizing:border-box"></textarea>
-        <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
-          <button id="fmt_import_apply"
-            style="padding:8px 14px;background:rgba(80,180,140,0.15);border:1px solid rgba(80,180,140,0.5);color:#70e8c0;border-radius:8px;cursor:pointer;font-size:13px">
-            ⬆️ Применить JSON
-          </button>
-          <span id="fmt_import_status" style="font-size:11px;opacity:.75"></span>
-        </div>
-      </div>`
-    );
-
-    setTimeout(() => {
-      // File picker button
-      document.getElementById('fmt_import_file_btn')?.addEventListener('click', () => {
-        document.getElementById('fmt_import_file_input')?.click();
-      });
-
-      // Read selected file into textarea
-      document.getElementById('fmt_import_file_input')?.addEventListener('change', (ev) => {
-        const file = ev.target.files?.[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const ta = document.getElementById('fmt_import_textarea');
-          if (ta) ta.value = e.target.result;
-          const st = document.getElementById('fmt_import_status');
-          if (st) st.textContent = `📄 Загружен: ${file.name}`;
+        url = `${baseUrl}/v1/models`;
+        fetchOptions = {
+            method: 'GET',
+            headers: { 'Authorization': `Bearer ${settings.apiKey}` }
         };
-        reader.onerror = () => toastr.error('Не удалось прочитать файл');
-        reader.readAsText(file);
-      });
+    }
 
-      // Apply JSON from textarea
-      document.getElementById('fmt_import_apply')?.addEventListener('click', async () => {
-        const raw = document.getElementById('fmt_import_textarea')?.value?.trim();
-        if (!raw) { toastr.warning('Вставьте JSON или выберите файл'); return; }
-        try {
-          const { saveMetadata, chatMetadata } = ctx();
-          const p = JSON.parse(raw);
-          if (!p || typeof p !== 'object') throw new Error('Not an object');
-          p.facts               = Array.isArray(p.facts)  ? p.facts  : [];
-          p.lastScannedMsgIndex = p.lastScannedMsgIndex   || 0;
-          p.scanLog             = Array.isArray(p.scanLog) ? p.scanLog : [];
-          chatMetadata[chatKey()] = p;
-          await saveMetadata();
-          await updateInjectedPrompt();
-          await renderDrawer();
-          await renderWidget();
-          toastr.success(`✅ Импортировано ${p.facts.length} фактов`);
-          const st = document.getElementById('fmt_import_status');
-          if (st) st.textContent = `✅ Готово (${p.facts.length} фактов)`;
-        } catch (e) {
-          toastr.error('[FMT] Неверный JSON: ' + e.message);
-          const st = document.getElementById('fmt_import_status');
-          if (st) st.textContent = `❌ ${e.message}`;
+    try {
+        const response = await fetch(url, fetchOptions);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+
+        let modelIds = [];
+        if (isGemini) {
+            const models = data.models || [];
+            modelIds = models.map(m => (m.name || '').replace('models/', ''))
+                .filter(id => id.includes('image') || id.includes('flash') || id.includes('pro'));
+        } else {
+            const models = data.data || [];
+            modelIds = models.filter(m => isImageModel(m.id)).map(m => m.id);
         }
-      });
-    }, 0);
-  }
+        console.log(`[IIG] Fetched ${modelIds.length} models`);
+        return modelIds;
+    } catch (error) {
+        console.error('[IIG] Failed to fetch models:', error);
+        toastr.error(`Ошибка загрузки моделей: ${error.message}`, 'Генерация картинок');
+        return [];
+    }
+}
 
-  // ─── Prompt preview ───────────────────────────────────────────────────────────
+async function fetchUserAvatars() {
+    try {
+        const context = SillyTavern.getContext();
+        const response = await fetch('/api/avatars/get', {
+            method: 'POST',
+            headers: context.getRequestHeaders(),
+        });
 
-  async function showPromptPreview() {
-    const state    = await getChatState();
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        return await response.json();
+    } catch (error) {
+        console.error('[IIG] Failed to fetch user avatars:', error);
+        return [];
+    }
+}
+
+async function imageUrlToBase64(url) {
+    try {
+        const response = await fetch(url);
+        const blob = await response.blob();
+
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                const base64 = reader.result.split(',')[1];
+                resolve(base64);
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    } catch (error) {
+        console.error('[IIG] Failed to convert image to base64:', error);
+        return null;
+    }
+}
+
+async function compressImageForReference(base64Data, maxSize = 1024, quality = 0.8) {
+    return new Promise((resolve, reject) => {
+        try {
+            const img = new Image();
+            img.onload = () => {
+                let width = img.width;
+                let height = img.height;
+
+                if (width > maxSize || height > maxSize) {
+                    if (width > height) {
+                        height = Math.round(height * maxSize / width);
+                        width = maxSize;
+                    } else {
+                        width = Math.round(width * maxSize / height);
+                        height = maxSize;
+                    }
+                }
+
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, width, height);
+
+                const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
+                const compressedBase64 = compressedDataUrl.replace('data:image/jpeg;base64,', '');
+
+                console.log(`[IIG] Compressed image: ${img.width}x${img.height} -> ${width}x${height}, size: ${Math.round(compressedBase64.length / 1024)}KB`);
+                resolve(compressedBase64);
+            };
+            img.onerror = () => reject(new Error('Failed to load image for compression'));
+            img.src = `data:image/png;base64,${base64Data}`;
+        } catch (error) {
+            reject(error);
+        }
+    });
+}
+
+function saveCurrentAsPreset(presetName) {
     const settings = getSettings();
-    const block    = buildInjectedBlock(state, settings) || '[Нет активных фактов выше порога]';
-    const tokens   = estimateTokens(block);
-    await ctx().Popup.show.text(
-      `FMT — Промпт (~${tokens} токенов)`,
-      `<pre style="white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;font-family:Consolas,monospace;background:#0a1220;color:#c8deff;padding:12px;border-radius:8px">${escHtml(block)}</pre>`
-    );
-  }
 
-  // ─── Scan log ─────────────────────────────────────────────────────────────────
-
-  async function showScanLog() {
-    const state = await getChatState();
-    const log   = state.scanLog || [];
-    if (!log.length) { toastr.info('Лог сканирований пуст'); return; }
-    const rows = log.map(e => {
-      const d = new Date(e.ts).toLocaleString('ru-RU');
-      return `<tr><td style="padding:4px 10px">${d}</td><td>${e.mode||'manual'}</td><td>${e.from}–${e.to}</td><td><b style="color:${e.added>0?'#70e8c0':'#888'}">${e.added}</b></td></tr>`;
-    }).join('');
-    await ctx().Popup.show.text('FMT — История сканирований', `
-      <table style="width:100%;border-collapse:collapse;font-size:12px;color:#c8deff">
-        <thead><tr style="color:#90b8f8;border-bottom:1px solid rgba(100,160,255,0.2)">
-          <th style="padding:6px 10px;text-align:left">Время</th>
-          <th>Режим</th><th>Сообщения</th><th>Добавлено</th>
-        </tr></thead>
-        <tbody>${rows}</tbody>
-      </table>`);
-  }
-
-  // ─── Settings panel ───────────────────────────────────────────────────────────
-
-  async function mountSettingsUi() {
-    if ($('#fmt_settings_block').length) return;
-    const target = $('#extensions_settings2').length ? '#extensions_settings2' : '#extensions_settings';
-    if (!$(target).length) { console.warn('[FMT] settings container not found'); return; }
-
-    const s = getSettings();
-    currentSortMode = s.sortMode || 'date';
-
-    const secState = (() => {
-      try { return JSON.parse(localStorage.getItem('fmt_sec_state') || '{}'); } catch { return {}; }
-    })();
-    const saveSec = () => { try { localStorage.setItem('fmt_sec_state', JSON.stringify(secState)); } catch {} };
-
-    const sec = (id, icon, title, content, defaultOpen = false) => {
-      const open = secState[id] !== undefined ? secState[id] : defaultOpen;
-      return `
-        <div class="fmt-sec" id="fmt_sec_${id}">
-          <div class="fmt-sec-hdr" data-sec="${id}">
-            <span class="fmt-sec-chev">${open ? '▾' : '▸'}</span>
-            <span>${icon} ${title}</span>
-          </div>
-          <div class="fmt-sec-body"${open ? '' : ' style="display:none"'}>${content}</div>
-        </div>`;
-    };
-
-    const secBasic = `
-      <div class="fmt-2col">
-        <label class="fmt-ck"><input type="checkbox" id="fmt_enabled" ${s.enabled?'checked':''}><span>Инъекция в промпт</span></label>
-        <label class="fmt-ck"><input type="checkbox" id="fmt_show_widget" ${s.showWidget?'checked':''}><span>Виджет 🧠</span></label>
-      </div>
-      <div class="fmt-srow fmt-slider-row">
-        <label>Размер виджета:</label>
-        <input type="range" id="fmt_fab_scale" min="0.4" max="1.4" step="0.1" value="${s.fabScale??0.8}">
-        <span id="fmt_fab_scale_val">${Math.round((s.fabScale??0.8)*100)}%</span>
-      </div>
-      <div class="fmt-compact-btns">
-        <button class="menu_button" id="fmt_open_drawer_btn">📂 Открыть трекер</button>
-        <button class="menu_button" id="fmt_scan_settings_btn">🔍 Сканировать</button>
-        <button class="menu_button" id="fmt_reset_pos_btn">↺ Позиция</button>
-      </div>`;
-
-    const secScan = `
-      <div class="fmt-2col">
-        <label class="fmt-ck"><input type="checkbox" id="fmt_auto_scan" ${s.autoScan?'checked':''}><span>Авто-скан</span></label>
-        <label class="fmt-ck"><input type="checkbox" id="fmt_auto_marker" ${s.autoMarker?'checked':''}><span>Авто-маркер [FACT:]</span></label>
-      </div>
-      <div class="fmt-srow fmt-slider-row">
-        <label>Каждые:</label>
-        <input type="range" id="fmt_auto_every" min="5" max="100" step="5" value="${s.autoScanEvery}">
-        <span id="fmt_auto_every_val">${s.autoScanEvery}</span><span style="opacity:.5;font-size:10px">сообщ.</span>
-      </div>
-      <div class="fmt-srow fmt-slider-row">
-        <label>Глубина:</label>
-        <input type="range" id="fmt_scan_depth" min="10" max="200" step="10" value="${s.scanDepth}">
-        <span id="fmt_scan_depth_val">${s.scanDepth}</span><span style="opacity:.5;font-size:10px">сообщ.</span>
-      </div>
-      <div style="font-size:10px;color:rgba(120,220,160,.55);margin-top:4px;line-height:1.5">
-        ⚠️ Скрытые сообщения, саммари и лорбуки автоматически исключаются из сканирования.
-      </div>`;
-
-    const secInject = `
-      <div class="fmt-srow">
-        <label style="white-space:nowrap;font-size:12px">Важность ≥</label>
-        <select id="fmt_inject_imp" style="flex:1">
-          <option value="low" ${s.injectImportance==='low'?'selected':''}>⚪ Все</option>
-          <option value="medium" ${s.injectImportance==='medium'?'selected':''}>🟡 Medium+</option>
-          <option value="high" ${s.injectImportance==='high'?'selected':''}>🔴 High only</option>
-        </select>
-      </div>
-      <div class="fmt-srow fmt-slider-row">
-        <label>Макс. фактов:</label>
-        <input type="range" id="fmt_max_facts" min="5" max="100" step="5" value="${s.maxInjectFacts||30}">
-        <span id="fmt_max_facts_val">${s.maxInjectFacts||30}</span>
-      </div>
-      <div style="margin-top:6px">
-        <div style="font-size:10px;color:rgba(180,200,240,.5);margin-bottom:3px;text-transform:uppercase;letter-spacing:.04em">Шаблон промпта <code style="background:rgba(100,160,255,.1);padding:1px 4px;border-radius:3px">{{facts}}</code></div>
-        <textarea id="fmt_prompt_tpl" rows="3">${escHtml(s.promptTemplate||DEFAULT_PROMPT_TEMPLATE)}</textarea>
-        <button class="menu_button" id="fmt_reset_tpl_btn" style="margin-top:3px;padding:3px 8px;font-size:10px">↩ Сброс</button>
-      </div>`;
-
-    const flashCats = s.flashCats || ['flashbacks','secrets','characters'];
-    const secFlash = `
-      <div class="fmt-2col">
-        <label class="fmt-ck"><input type="checkbox" id="fmt_flash_enabled" ${s.flashEnabled!==false?'checked':''}><span>Включён</span></label>
-      </div>
-      <div class="fmt-srow fmt-slider-row">
-        <label>Авто-шанс:</label>
-        <input type="range" id="fmt_flash_chance" min="0" max="30" step="1" value="${s.flashChance||0}">
-        <span id="fmt_flash_chance_val">${s.flashChance||0}%</span>
-      </div>
-      <div style="font-size:11px;color:rgba(180,200,240,.6);margin:4px 0 3px">Категории для флешбека:</div>
-      <div class="fmt-2col">
-        ${Object.entries(CATEGORIES).map(([k,v])=>`
-          <label class="fmt-ck"><input type="checkbox" class="fmt-flash-cat-cb" value="${k}" ${flashCats.includes(k)?'checked':''}><span>${v.icon} ${v.label}</span></label>`).join('')}
-      </div>
-      <div style="font-size:10px;color:rgba(180,200,240,.4);margin-top:4px;line-height:1.5">
-        Кнопка ⚡ в трекере — ручной запуск. Авто-шанс срабатывает на каждое сообщение юзера.
-      </div>`;
-
-    const hasCustomApi = !!(s.apiEndpoint || '').trim();
-    const secApi = `
-      <div class="fmt-api-mode-bar">
-        <div class="fmt-api-mode-label">Источник генерации:</div>
-        <div class="fmt-api-mode-btns">
-          <button class="fmt-api-mode-btn ${!hasCustomApi?'active':''}" data-mode="st">🟢 ST (текущий)</button>
-          <button class="fmt-api-mode-btn ${hasCustomApi?'active':''}" data-mode="custom">🔌 Кастомный API</button>
-        </div>
-      </div>
-      <div id="fmt_mode_st" ${hasCustomApi?'style="display:none"':''}>
-        <div class="fmt-api-st-info">
-          ✅ FMT использует модель которая сейчас подключена в SillyTavern.<br>
-          Никаких дополнительных настроек не нужно — всё работает из коробки.
-        </div>
-      </div>
-      <div id="fmt_mode_custom" ${!hasCustomApi?'style="display:none"':''}>
-        <div style="font-size:10px;color:rgba(100,220,160,.6);margin-bottom:7px;line-height:1.5">
-          Отдельный API для сканирования. Авто-перебор эндпоинтов и форматов.
-        </div>
-        <div class="fmt-2col" style="margin-bottom:6px">
-          <label class="fmt-ck"><input type="checkbox" id="fmt_fallback_enabled" ${s.fallbackEnabled!==false?'checked':''}><span>Fallback на ST если недоступен</span></label>
-        </div>
-        <input type="text" id="fmt_api_endpoint" class="fmt-api-field" placeholder="http://localhost:1234/v1 или https://api.openai.com" value="${escHtml(s.apiEndpoint||'')}">
-        <div class="fmt-srow" style="gap:5px;margin-top:4px">
-          <input type="password" id="fmt_api_key" class="fmt-api-field" placeholder="API Key (необязателен)" value="${s.apiKey||''}" style="margin-bottom:0;flex:1">
-          <button type="button" id="fmt_api_key_toggle" class="menu_button" style="padding:4px 8px;flex-shrink:0">👁</button>
-        </div>
-        <div class="fmt-srow" style="gap:5px;margin-top:4px">
-          <select id="fmt_api_model" class="fmt-api-select" style="flex:1">
-            ${s.apiModel?`<option value="${escHtml(s.apiModel)}" selected>${escHtml(s.apiModel)}</option>`:'<option value="">-- введи или загрузи 🔄 --</option>'}
-          </select>
-          <button type="button" id="fmt_refresh_models" class="menu_button" style="padding:4px 8px;flex-shrink:0" title="Загрузить список моделей">🔄</button>
-        </div>
-        <div class="fmt-srow" style="gap:5px;margin-top:4px">
-          <input type="text" id="fmt_api_model_manual" class="fmt-api-field" placeholder="Или введи модель вручную (gpt-4o-mini, llama3 и т.д.)" value="${s.apiModel||''}" style="margin-bottom:0;flex:1">
-        </div>
-        <div class="fmt-srow" style="gap:5px;margin-top:6px">
-          <button type="button" id="fmt_test_api" class="menu_button" style="flex:1;padding:5px 8px;font-size:11px">🔌 Тест соединения</button>
-        </div>
-        <div id="fmt_api_status" style="margin-top:5px;font-size:10px;min-height:14px"></div>
-      </div>`;
-
-    $(target).append(`
-      <div class="fmt-settings-block" id="fmt_settings_block">
-        <div class="fmt-settings-title">
-          <span>🧠 Память фактов</span>
-          <button type="button" id="fmt_collapse_btn">${s.collapsed?'▸':'▾'}</button>
-        </div>
-        <div class="fmt-settings-body"${s.collapsed?' style="display:none"':''}>
-          ${sec('basic',  '⚙️', 'Основное',    secBasic,  true)}
-          ${sec('scan',   '🔍', 'Сканирование', secScan,   false)}
-          ${sec('inject', '💉', 'Инъекция',     secInject, false)}
-          ${sec('flash',  '⚡', 'Флешбек',      secFlash,  false)}
-          ${sec('api',    '🔌', 'API',          secApi,    false)}
-        </div>
-      </div>
-    `);
-
-    $(document).off('click.fmt_sec').on('click.fmt_sec', '.fmt-sec-hdr', function () {
-      const id   = this.getAttribute('data-sec');
-      const body = $(this).next('.fmt-sec-body');
-      const open = body.is(':visible');
-      body.toggle(!open);
-      $(this).find('.fmt-sec-chev').text(open ? '▸' : '▾');
-      secState[id] = !open;
-      saveSec();
-    });
-
-    $('#fmt_collapse_btn').on('click', () => {
-      s.collapsed = !s.collapsed;
-      $('#fmt_settings_block .fmt-settings-body').toggle(!s.collapsed);
-      $('#fmt_collapse_btn').text(s.collapsed ? '▸' : '▾');
-      ctx().saveSettingsDebounced();
-    });
-
-    $('#fmt_enabled').on('input',    async ev => { s.enabled    = $(ev.currentTarget).prop('checked'); ctx().saveSettingsDebounced(); await updateInjectedPrompt(); });
-    $('#fmt_show_widget').on('input',async ev => { s.showWidget = $(ev.currentTarget).prop('checked'); ctx().saveSettingsDebounced(); await renderWidget(); });
-    $('#fmt_auto_scan').on('input',       ev => { s.autoScan   = $(ev.currentTarget).prop('checked'); ctx().saveSettingsDebounced(); });
-    $('#fmt_auto_marker').on('input',     ev => { s.autoMarker = $(ev.currentTarget).prop('checked'); ctx().saveSettingsDebounced(); });
-
-    $('#fmt_fab_scale').on('input', ev => {
-      const v = parseFloat($(ev.currentTarget).val());
-      s.fabScale = v;
-      $('#fmt_fab_scale_val').text(Math.round(v * 100) + '%');
-      ctx().saveSettingsDebounced();
-      applyFabScale();
-      applyFabPosition();
-    });
-
-    $('#fmt_auto_every').on('input', ev => { const v = +$(ev.currentTarget).val(); s.autoScanEvery  = v; $('#fmt_auto_every_val').text(v);  ctx().saveSettingsDebounced(); });
-    $('#fmt_scan_depth').on('input', ev => { const v = +$(ev.currentTarget).val(); s.scanDepth      = v; $('#fmt_scan_depth_val').text(v);  ctx().saveSettingsDebounced(); });
-    $('#fmt_max_facts').on('input',  ev => { const v = +$(ev.currentTarget).val(); s.maxInjectFacts = v; $('#fmt_max_facts_val').text(v);   ctx().saveSettingsDebounced(); });
-
-    $('#fmt_inject_imp').on('change', async ev => { s.injectImportance = $(ev.currentTarget).val(); ctx().saveSettingsDebounced(); await updateInjectedPrompt(); });
-
-    $('#fmt_flash_enabled').on('input', ev => { s.flashEnabled = $(ev.currentTarget).prop('checked'); ctx().saveSettingsDebounced(); });
-    $('#fmt_flash_chance').on('input', ev => {
-      const v = +$(ev.currentTarget).val();
-      s.flashChance = v;
-      $('#fmt_flash_chance_val').text(v + '%');
-      ctx().saveSettingsDebounced();
-    });
-    $(document).on('change.fmt_flash_cats', '.fmt-flash-cat-cb', () => {
-      const cats = [];
-      document.querySelectorAll('.fmt-flash-cat-cb:checked').forEach(el => cats.push(el.value));
-      s.flashCats = cats;
-      ctx().saveSettingsDebounced();
-    });
-
-    $('#fmt_prompt_tpl').on('input', () => { s.promptTemplate = $('#fmt_prompt_tpl').val(); ctx().saveSettingsDebounced(); });
-    $('#fmt_reset_tpl_btn').on('click', async () => {
-      s.promptTemplate = DEFAULT_PROMPT_TEMPLATE;
-      $('#fmt_prompt_tpl').val(DEFAULT_PROMPT_TEMPLATE);
-      ctx().saveSettingsDebounced();
-      await updateInjectedPrompt();
-      toastr.success('Шаблон сброшен');
-    });
-
-    $(document).off('click.fmt_apimode').on('click.fmt_apimode', '.fmt-api-mode-btn', function () {
-      const mode = this.getAttribute('data-mode');
-      document.querySelectorAll('.fmt-api-mode-btn').forEach(b => b.classList.remove('active'));
-      this.classList.add('active');
-      if (mode === 'st') {
-        $('#fmt_mode_st').show(); $('#fmt_mode_custom').hide();
-        s.apiEndpoint = ''; s.apiKey = '';
-        _workingApiConfig = null;
-        ctx().saveSettingsDebounced();
-        toastr.info('[FMT] Используется ST (текущая подключённая модель)', '', { timeOut: 2500 });
-      } else {
-        $('#fmt_mode_st').hide(); $('#fmt_mode_custom').show();
-      }
-    });
-
-    $('#fmt_api_endpoint').on('input', () => {
-      s.apiEndpoint = $('#fmt_api_endpoint').val().trim();
-      _workingApiConfig = null;
-      ctx().saveSettingsDebounced();
-    });
-    $('#fmt_api_key').on('input', () => {
-      s.apiKey = $('#fmt_api_key').val().trim();
-      _workingApiConfig = null;
-      ctx().saveSettingsDebounced();
-    });
-    $('#fmt_api_key_toggle').on('click', () => {
-      const inp = document.getElementById('fmt_api_key');
-      inp.type = inp.type === 'password' ? 'text' : 'password';
-    });
-    $('#fmt_api_model').on('change', () => {
-      s.apiModel = $('#fmt_api_model').val();
-      $('#fmt_api_model_manual').val(s.apiModel);
-      _workingApiConfig = null;
-      ctx().saveSettingsDebounced();
-    });
-    $('#fmt_api_model_manual').on('input', () => {
-      const v = $('#fmt_api_model_manual').val().trim();
-      s.apiModel = v;
-      _workingApiConfig = null;
-      ctx().saveSettingsDebounced();
-    });
-    $('#fmt_fallback_enabled').on('input', ev => {
-      s.fallbackEnabled = $(ev.currentTarget).prop('checked');
-      ctx().saveSettingsDebounced();
-    });
-
-    $('#fmt_test_api').on('click', async () => {
-      const $btn    = $('#fmt_test_api');
-      const $status = $('#fmt_api_status');
-      $btn.prop('disabled', true).text('⏳ Проверка…');
-      $status.css('color', 'rgba(180,200,240,.5)').text('Перебираю эндпоинты…');
-      try {
-        const cfg = await testApiConnection();
-        _workingApiConfig = { base: getBaseUrl(), url: cfg.url, builder: cfg.builder };
-        $status.css('color', '#70e8c0').text(`✅ Работает: ${cfg.url.replace(getBaseUrl(), '')}`);
-        toastr.success('[FMT] API отвечает корректно');
-      } catch (e) {
-        $status.css('color', '#ff7070').text(`❌ ${e.message}`);
-        toastr.error('[FMT] ' + e.message);
-      } finally {
-        $btn.prop('disabled', false).text('🔌 Тест соединения');
-      }
-    });
-
-    $('#fmt_refresh_models').on('click', async () => {
-      const $btn = $('#fmt_refresh_models');
-      $btn.prop('disabled', true).text('⏳');
-      try {
-        const models  = await fetchModels();
-        const current = s.apiModel || '';
-        const $sel    = $('#fmt_api_model');
-        $sel.html('<option value="">-- выбери модель --</option>');
-        models.forEach(id => $sel.append(new Option(id, id, id === current, id === current)));
-        toastr.success(`Загружено: ${models.length} моделей`);
-      } catch (e) {
-        toastr.warning(`[FMT] ${e.message} — введи модель вручную`);
-      } finally {
-        $btn.prop('disabled', false).text('🔄');
-      }
-    });
-
-    $(document)
-      .off('click.fmt_settings')
-      .on('click.fmt_settings', '#fmt_open_drawer_btn',   () => openDrawer(true))
-      .on('click.fmt_settings', '#fmt_scan_settings_btn', () => runScan('manual'))
-      .on('click.fmt_settings', '#fmt_reset_pos_btn', () => {
-        try { localStorage.removeItem(FAB_POS_KEY); } catch {}
-        setFabDefault(); toastr.success('Позиция сброшена');
-      });
-  }
-
-  // ─── Flashback trigger ────────────────────────────────────────────────────────
-
-  function buildFlashBlock(fact) {
-    const catMeta = CATEGORIES[fact.category] || CATEGORIES.events;
-    return `[ФЛЕШБЕК — ТОЛЬКО ДЛЯ ЭТОГО ОТВЕТА]
-В этом ответе {{char}} внезапно — посреди сцены или разговора — переживает краткое непроизвольное воспоминание или внутренний образ, связанный со следующим фактом:
-
-${catMeta.icon} «${fact.text}»
-
-Инструкция:
-- Воспоминание должно прорваться естественно, как вспышка — образ, запах, звук, обрывок фразы
-- Не объясняй это игроку напрямую — покажи через поведение, паузу, изменение тона {{char}}
-- Флешбек короткий (1–3 предложения), не должен занимать весь ответ
-- После него {{char}} возвращается к текущей сцене
-[/ФЛЕШБЕК]`;
-  }
-
-  function applyFlashQueue() {
-    if (!flashQueue.length) {
-      try { ctx().setExtensionPrompt(FLASHBACK_TAG, '', EXT_PROMPT_TYPES.IN_PROMPT, 0, true); } catch {}
-      return;
-    }
-    const next = flashQueue[0];
-    try { ctx().setExtensionPrompt(FLASHBACK_TAG, next.block, EXT_PROMPT_TYPES.IN_PROMPT, 0, true); } catch {}
-  }
-
-  async function triggerFlashback(factId = null) {
-    const s     = getSettings();
-    const state = await getChatState();
-
-    const allowed = s.flashCats || ['flashbacks', 'secrets', 'characters'];
-    const pool    = state.facts.filter(f => !f.disabled && allowed.includes(f.category));
-
-    if (!pool.length) {
-      toastr.warning('[FMT] Нет подходящих фактов для флешбека.');
-      return;
+    if (!presetName || !presetName.trim()) {
+        toastr.warning('Введите название пресета', 'Пресеты API');
+        return false;
     }
 
-    const fact = factId
-      ? (pool.find(f => f.id === factId) ?? pool[Math.floor(Math.random() * pool.length)])
-      : pool[Math.floor(Math.random() * pool.length)];
+    presetName = presetName.trim();
 
-    const entry = {
-      id:       makeId(),
-      factId:   fact.id,
-      factText: fact.text,
-      factCat:  fact.category,
-      block:    buildFlashBlock(fact),
-      ts:       Date.now(),
-    };
+    if (!settings.apiPresets) {
+        settings.apiPresets = [];
+    }
 
-    flashQueue.push(entry);
-    applyFlashQueue();
-    renderFlashQueueUI();
-
-    const qLen = flashQueue.length;
-    toastr.info(
-      `⚡ Флешбек добавлен${qLen > 1 ? ` (в очереди: ${qLen})` : ''}: «${fact.text.slice(0, 55)}${fact.text.length > 55 ? '…' : ''}»`,
-      'FMT',
-      { timeOut: 4000 }
+    // Проверить дубликат
+    const existingIndex = settings.apiPresets.findIndex(
+        p => p.name.toLowerCase() === presetName.toLowerCase()
     );
 
-    const row = document.querySelector(`.fmt-fact-row[data-id="${fact.id}"]`);
-    if (row) {
-      row.classList.add('fmt-flash-highlight');
-      setTimeout(() => row.classList.remove('fmt-flash-highlight'), 2500);
-    }
-  }
+    const preset = {
+        name: presetName,
+        endpoint: settings.endpoint,
+        apiKey: settings.apiKey,
+        model: settings.model,
+        apiType: settings.apiType,
+    };
 
-  function consumeFlashQueue() {
-    if (!flashQueue.length) return;
-    const fired = flashQueue.shift();
-    flashHistory.unshift({ ...fired, fired: Date.now() });
-    if (flashHistory.length > MAX_FLASH_HISTORY) flashHistory.length = MAX_FLASH_HISTORY;
-    applyFlashQueue();
-    renderFlashQueueUI();
-  }
-
-  function removeFromFlashQueue(id) {
-    const idx = flashQueue.findIndex(e => e.id === id);
-    if (idx < 0) return;
-    flashQueue.splice(idx, 1);
-    applyFlashQueue();
-    renderFlashQueueUI();
-    toastr.info('[FMT] Флешбек убран из очереди', '', { timeOut: 2000 });
-  }
-
-  function clearFlashQueue() {
-    flashQueue.length = 0;
-    try { ctx().setExtensionPrompt(FLASHBACK_TAG, '', EXT_PROMPT_TYPES.IN_PROMPT, 0, true); } catch {}
-    renderFlashQueueUI();
-    toastr.info('[FMT] Очередь флешбеков очищена', '', { timeOut: 2000 });
-  }
-
-  function renderFlashQueueUI() {
-    const $panel = $('#fmt_flash_panel');
-    if (!$panel.length) return;
-
-    const hasQueue   = flashQueue.length > 0;
-    const hasHistory = flashHistory.length > 0;
-
-    if (!hasQueue && !hasHistory) { $panel.hide(); return; }
-
-    $panel.show();
-    let html = '';
-
-    if (hasQueue) {
-      html += `<div class="fmt-fq-section">
-        <div class="fmt-fq-title">
-          ⏳ Очередь (${flashQueue.length})
-          <button class="fmt-fq-clear-all" title="Очистить всю очередь">✕ всё</button>
-        </div>`;
-      flashQueue.forEach((e, i) => {
-        const cat = CATEGORIES[e.factCat] || CATEGORIES.events;
-        html += `<div class="fmt-fq-row">
-          <span class="fmt-fq-pos">${i + 1}</span>
-          <span class="fmt-fq-cat">${cat.icon}</span>
-          <span class="fmt-fq-text">${escHtml(e.factText.slice(0, 70))}${e.factText.length > 70 ? '…' : ''}</span>
-          <button class="fmt-fq-remove" data-qid="${e.id}" title="Убрать из очереди">✕</button>
-        </div>`;
-      });
-      html += '</div>';
+    if (existingIndex !== -1) {
+        settings.apiPresets[existingIndex] = preset;
+        toastr.info(`Пресет "${presetName}" обновлён`, 'Пресеты API');
+    } else {
+        settings.apiPresets.push(preset);
+        toastr.success(`Пресет "${presetName}" сохранён`, 'Пресеты API');
     }
 
-    if (hasHistory) {
-      html += `<div class="fmt-fq-section fmt-fq-history">
-        <div class="fmt-fq-title">🕓 Сработали (последние ${flashHistory.length})</div>`;
-      flashHistory.forEach(e => {
-        const cat  = CATEGORIES[e.factCat] || CATEGORIES.events;
-        const time = new Date(e.fired).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-        html += `<div class="fmt-fq-row fmt-fq-fired">
-          <span class="fmt-fq-cat">${cat.icon}</span>
-          <span class="fmt-fq-text">${escHtml(e.factText.slice(0, 70))}${e.factText.length > 70 ? '…' : ''}</span>
-          <span class="fmt-fq-time">${time}</span>
-        </div>`;
-      });
-      html += '</div>';
+    saveSettings();
+    renderPresetList();
+    return true;
+}
+
+function loadPreset(index) {
+    const settings = getSettings();
+
+    if (!settings.apiPresets || !settings.apiPresets[index]) {
+        toastr.error('Пресет не найден', 'Пресеты API');
+        return;
     }
 
-    $panel.html(html);
-    $panel.find('.fmt-fq-clear-all').off('click').on('click', clearFlashQueue);
-    $panel.find('.fmt-fq-remove').off('click').on('click', function () {
-      removeFromFlashQueue(this.getAttribute('data-qid'));
+    const preset = settings.apiPresets[index];
+
+    settings.endpoint = preset.endpoint;
+    settings.apiKey = preset.apiKey;
+    settings.model = preset.model;
+    settings.apiType = preset.apiType;
+
+    saveSettings();
+
+    // Обновить UI поля
+    const endpointEl = document.getElementById('iig_endpoint');
+    const apiKeyEl = document.getElementById('iig_api_key');
+    const modelEl = document.getElementById('iig_model');
+    const apiTypeEl = document.getElementById('iig_api_type');
+
+    if (endpointEl) endpointEl.value = preset.endpoint;
+    if (apiKeyEl) apiKeyEl.value = preset.apiKey;
+    if (apiTypeEl) {
+        apiTypeEl.value = preset.apiType;
+        const geminiSection = document.getElementById('iig_gemini_section');
+        if (geminiSection) {
+            geminiSection.classList.toggle('hidden', preset.apiType !== 'gemini');
+        }
+    }
+    if (modelEl) {
+        // Если модели нет в списке — добавить как опцию
+        let found = false;
+        for (const opt of modelEl.options) {
+            if (opt.value === preset.model) {
+                found = true;
+                break;
+            }
+        }
+        if (!found && preset.model) {
+            const option = document.createElement('option');
+            option.value = preset.model;
+            option.textContent = preset.model;
+            modelEl.appendChild(option);
+        }
+        modelEl.value = preset.model;
+    }
+
+    toastr.success(`Пресет "${preset.name}" загружен`, 'Пресеты API');
+    iigLog('INFO', `Loaded API preset: "${preset.name}" (${preset.apiType}, ${preset.endpoint})`);
+}
+
+function deletePreset(index) {
+    const settings = getSettings();
+
+    if (!settings.apiPresets || !settings.apiPresets[index]) return;
+
+    const name = settings.apiPresets[index].name;
+    settings.apiPresets.splice(index, 1);
+    saveSettings();
+    renderPresetList();
+    toastr.info(`Пресет "${name}" удалён`, 'Пресеты API');
+}
+
+function renderPresetList() {
+    const settings = getSettings();
+    const container = document.getElementById('iig_preset_list');
+    if (!container) return;
+
+    container.innerHTML = '';
+
+    if (!settings.apiPresets || settings.apiPresets.length === 0) {
+        container.innerHTML = '<p style="color:#5a5252;font-size:11px;">Нет сохранённых пресетов</p>';
+        return;
+    }
+
+    for (let i = 0; i < settings.apiPresets.length; i++) {
+        const preset = settings.apiPresets[i];
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.alignItems = 'center';
+        row.style.gap = '8px';
+        row.style.marginBottom = '6px';
+
+        const nameSpan = document.createElement('span');
+        nameSpan.style.flex = '1';
+        nameSpan.style.color = '#e8e0e0';
+        nameSpan.style.fontSize = '12px';
+        nameSpan.style.overflow = 'hidden';
+        nameSpan.style.textOverflow = 'ellipsis';
+        nameSpan.style.whiteSpace = 'nowrap';
+
+        const typeBadge = preset.apiType === 'gemini' ? '🍌' : '🤖';
+        const maskedKey = preset.apiKey
+            ? preset.apiKey.substring(0, 4) + '••••' + preset.apiKey.slice(-4)
+            : 'нет ключа';
+        nameSpan.textContent = `${typeBadge} ${preset.name}`;
+        nameSpan.title = `${preset.endpoint}\nМодель: ${preset.model}\nКлюч: ${maskedKey}`;
+
+        const loadBtn = document.createElement('div');
+        loadBtn.className = 'menu_button';
+        loadBtn.title = 'Загрузить пресет';
+        loadBtn.innerHTML = '<i class="fa-solid fa-download"></i>';
+        loadBtn.addEventListener('click', () => loadPreset(i));
+
+        const updateBtn = document.createElement('div');
+        updateBtn.className = 'menu_button';
+        updateBtn.title = 'Перезаписать текущими настройками';
+        updateBtn.innerHTML = '<i class="fa-solid fa-pen"></i>';
+        updateBtn.addEventListener('click', () => {
+            saveCurrentAsPreset(preset.name);
+        });
+
+        const deleteBtn = document.createElement('div');
+        deleteBtn.className = 'menu_button';
+        deleteBtn.title = 'Удалить пресет';
+        deleteBtn.innerHTML = '<i class="fa-solid fa-trash"></i>';
+        deleteBtn.style.color = '#cc5555';
+        deleteBtn.addEventListener('click', () => deletePreset(i));
+
+        row.appendChild(nameSpan);
+        row.appendChild(loadBtn);
+        row.appendChild(updateBtn);
+        row.appendChild(deleteBtn);
+        container.appendChild(row);
+    }
+}
+
+function detectMimeType(base64Data) {
+    if (!base64Data || base64Data.length < 4) return 'image/png';
+    if (base64Data.startsWith('/9j/')) return 'image/jpeg';
+    if (base64Data.startsWith('iVBOR')) return 'image/png';
+    if (base64Data.startsWith('UklGR')) return 'image/webp';
+    if (base64Data.startsWith('R0lGOD')) return 'image/gif';
+    return 'image/png';
+}
+
+async function saveImageToFile(dataUrl) {
+    const context = SillyTavern.getContext();
+
+    console.log('[IIG] saveImageToFile input type:', dataUrl?.substring(0, 50));
+
+    if (dataUrl && !dataUrl.startsWith('data:') && (dataUrl.startsWith('http://') || dataUrl.startsWith('https://'))) {
+        console.log('[IIG] Downloading image from URL...');
+        try {
+            const response = await fetch(dataUrl);
+            const blob = await response.blob();
+
+            const base64 = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    resolve(reader.result);
+                };
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+            });
+
+            dataUrl = base64;
+            console.log('[IIG] Converted URL to data URL via FileReader');
+        } catch (err) {
+            console.error('[IIG] Failed to download image:', err);
+            throw new Error('Failed to download image from URL');
+        }
+    }
+
+    const match = dataUrl.match(/^data:image\/(\w+);base64,(.+)$/s);
+    if (!match) {
+        console.error('[IIG] Invalid data URL, starts with:', dataUrl?.substring(0, 100));
+        throw new Error('Invalid data URL format');
+    }
+
+    const format = match[1];
+    const base64Data = match[2];
+
+    console.log(`[IIG] Saving image: format=${format}, base64 length=${base64Data.length}`);
+
+    let charName = 'generated';
+    if (context.characterId !== undefined && context.characters?.[context.characterId]) {
+        charName = context.characters[context.characterId].name || 'generated';
+    }
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `iig_${timestamp}`;
+
+    const response = await fetch('/api/images/upload', {
+        method: 'POST',
+        headers: context.getRequestHeaders(),
+        body: JSON.stringify({
+            image: base64Data,
+            format: format,
+            ch_name: charName,
+            filename: filename
+        })
     });
-  }
 
-  // ─── Events ───────────────────────────────────────────────────────────────────
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+        throw new Error(error.error || `Upload failed: ${response.status}`);
+    }
 
-  function wireChatEvents() {
-    const { eventSource, event_types } = ctx();
+    const result = await response.json();
+    console.log('[IIG] Image saved to:', result.path);
+    return result.path;
+}
 
-    eventSource.on(event_types.APP_READY, async () => {
-      ensureFab(); applyFabPosition(); applyFabScale(); ensureDrawer();
-      await mountSettingsUi();
-      await updateInjectedPrompt();
-      await renderWidget();
+async function getCharacterAvatarBase64() {
+    try {
+        const context = SillyTavern.getContext();
+
+        console.log('[IIG] Getting character avatar, characterId:', context.characterId);
+
+        if (context.characterId === undefined || context.characterId === null) {
+            console.log('[IIG] No character selected');
+            return null;
+        }
+
+        if (typeof context.getCharacterAvatar === 'function') {
+            const avatarUrl = context.getCharacterAvatar(context.characterId);
+            console.log('[IIG] getCharacterAvatar returned:', avatarUrl);
+            if (avatarUrl) {
+                return await imageUrlToBase64(avatarUrl);
+            }
+        }
+
+        const character = context.characters?.[context.characterId];
+        console.log('[IIG] Character from array:', character?.name, 'avatar:', character?.avatar);
+        if (character?.avatar) {
+            // FIX: Try thumbnail endpoint first (works in most ST versions)
+            const thumbUrl = `/thumbnail?type=avatar&file=${encodeURIComponent(character.avatar)}`;
+            console.log('[IIG] Trying thumbnail avatar:', thumbUrl);
+            let result = await imageUrlToBase64(thumbUrl);
+            if (result) return result;
+
+            // Fallback: try direct characters path
+            const directUrl = `/characters/${encodeURIComponent(character.avatar)}`;
+            console.log('[IIG] Trying direct avatar path:', directUrl);
+            return await imageUrlToBase64(directUrl);
+        }
+
+        console.log('[IIG] Could not get character avatar');
+        return null;
+    } catch (error) {
+        console.error('[IIG] Error getting character avatar:', error);
+        return null;
+    }
+}
+
+async function getUserAvatarBase64() {
+    try {
+        const settings = getSettings();
+
+        if (!settings.userAvatarFile) {
+            console.log('[IIG] No user avatar selected in settings');
+            return null;
+        }
+
+        const avatarUrl = `/User Avatars/${encodeURIComponent(settings.userAvatarFile)}`;
+        console.log('[IIG] Using selected user avatar:', avatarUrl);
+        return await imageUrlToBase64(avatarUrl);
+    } catch (error) {
+        console.error('[IIG] Error getting user avatar:', error);
+        return null;
+    }
+}
+
+async function getLastGeneratedImageBase64(currentMessageId = null) {
+    try {
+        const context = SillyTavern.getContext();
+        const chat = context.chat || [];
+
+        for (let i = chat.length - 1; i >= 0; i--) {
+            const message = chat[i];
+
+            if (currentMessageId !== null && i === currentMessageId) {
+                continue;
+            }
+
+            const mes = message.mes || '';
+
+            const imgMatch = mes.match(/src=["']?(\/user\/images\/[^"'\s>]+)/i);
+            if (imgMatch) {
+                const imagePath = imgMatch[1];
+                console.log('[IIG] Found previous generated image:', imagePath);
+
+                const rawBase64 = await imageUrlToBase64(imagePath);
+                if (!rawBase64) return null;
+
+                console.log(`[IIG] Original previous image size: ${Math.round(rawBase64.length / 1024)}KB, compressing...`);
+                const compressed = await compressImageForReference(rawBase64, 1024, 0.8);
+                return compressed;
+            }
+        }
+
+        console.log('[IIG] No previous generated images found in chat');
+        return null;
+    } catch (error) {
+        console.error('[IIG] Error getting last generated image:', error);
+        return null;
+    }
+}
+
+async function generateImageOpenAI(prompt, style, referenceImages = [], options = {}) {
+    const settings = getSettings();
+    const url = `${settings.endpoint.replace(/\/$/, '')}/v1/images/generations`;
+
+    const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
+
+    let size = settings.size;
+    if (options.aspectRatio) {
+        if (options.aspectRatio === '16:9' || options.aspectRatio === '3:2') size = '1536x1024';
+        else if (options.aspectRatio === '9:16' || options.aspectRatio === '2:3') size = '1024x1536';
+        else if (options.aspectRatio === '1:1') size = '1024x1024';
+        else size = 'auto';
+    }
+
+    const body = {
+        model: settings.model,
+        prompt: fullPrompt,
+        n: 1
+    };
+
+    if (size && size !== 'auto') {
+        body.size = size;
+    }
+
+    body.response_format = 'b64_json';
+
+    if (referenceImages.length > 0) {
+        iigLog('WARN', `${referenceImages.length} reference image(s) collected but NOT sent - /v1/images/generations is text-to-image only. Labels: [${referenceImages.map(r => r.label || 'unknown').join(', ')}]. Consider switching to Gemini/nano-banana API type for reference support.`);
+    }
+
+    console.log('[IIG] OpenAI Request:', {
+        url: url,
+        model: body.model,
+        size: body.size || 'not set',
+        quality: body.quality || 'not set',
+        response_format: body.response_format || 'not set',
+        promptLength: fullPrompt.length,
+        bodyKeys: Object.keys(body)
     });
 
-    eventSource.on(event_types.CHAT_CHANGED, async () => {
-      msgSinceLastScan = 0;
-      scanInProgress = false;
-      await new Promise(r => setTimeout(r, 300));
-      await updateInjectedPrompt();
-      await renderWidget();
-      if ($('#fmt_drawer').hasClass('fmt-open')) await renderDrawer();
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${settings.apiKey}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body)
     });
 
-    eventSource.on(event_types.MESSAGE_RECEIVED, async (idx) => {
-      consumeFlashQueue();
-      const { chat } = ctx();
-      const msg = chat?.[idx];
-      if (msg && !msg.is_user) {
-        await detectFactMarkers(msg.mes || '');
-        await detectFlashbackMarkers(msg.mes || '');
-      }
-      await renderWidget();
-      const s = getSettings();
-      if (!s.autoScan) return;
-      msgSinceLastScan++;
-      if (msgSinceLastScan >= s.autoScanEvery) { msgSinceLastScan = 0; await runScan('auto'); }
+    if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`API Error (${response.status}): ${text}`);
+    }
+
+    const result = await response.json();
+
+    console.log('[IIG] OpenAI API response structure:', Object.keys(result));
+
+    const dataList = result.data || result.images || [];
+
+    if (dataList.length === 0) {
+        if (result.url) return result.url;
+        if (result.image) {
+            if (result.image.startsWith('data:')) return result.image;
+            return `data:image/png;base64,${result.image}`;
+        }
+        if (result.b64_json) {
+            return `data:image/png;base64,${result.b64_json}`;
+        }
+        console.error('[IIG] Full response:', JSON.stringify(result).substring(0, 500));
+        throw new Error('No image data in response');
+    }
+
+    const imageObj = dataList[0];
+    console.log('[IIG] Image object keys:', Object.keys(imageObj));
+
+    const b64Data = imageObj.b64_json || imageObj.b64 || imageObj.base64 || imageObj.image;
+    const urlData = imageObj.url || imageObj.uri;
+
+    if (b64Data) {
+        if (b64Data.startsWith('data:')) {
+            return b64Data;
+        }
+        let mimeType = 'image/png';
+        if (b64Data.startsWith('/9j/')) mimeType = 'image/jpeg';
+        else if (b64Data.startsWith('R0lGOD')) mimeType = 'image/gif';
+        else if (b64Data.startsWith('UklGR')) mimeType = 'image/webp';
+
+        console.log(`[IIG] Image mime type detected: ${mimeType}, data length: ${b64Data.length}`);
+        return `data:${mimeType};base64,${b64Data}`;
+    }
+
+    if (urlData) {
+        console.log('[IIG] Got URL instead of base64:', urlData.substring(0, 100));
+        return urlData;
+    }
+
+    console.error('[IIG] Unexpected image object structure:', JSON.stringify(imageObj).substring(0, 300));
+    throw new Error('Unexpected image response format');
+}
+
+const VALID_ASPECT_RATIOS = ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'];
+const VALID_IMAGE_SIZES = ['1K', '2K', '4K'];
+
+function nameAppearsInPrompt(name, prompt) {
+    if (!name || !prompt) return false;
+
+    const nameLower = name.toLowerCase();
+    const promptLower = prompt.toLowerCase();
+
+    if (promptLower.includes(nameLower)) return true;
+
+    if (nameLower.length > 3) {
+        const nameBase1 = nameLower.slice(0, -1);
+        const nameBase2 = nameLower.slice(0, -2);
+        if (promptLower.includes(nameBase1) || promptLower.includes(nameBase2)) return true;
+    }
+
+    return false;
+}
+
+async function generateImageGemini(prompt, style, referenceImages = [], options = {}) {
+    const settings = getSettings();
+    const model = settings.model;
+    const baseUrl = settings.endpoint.replace(/\/$/, '');
+    const isGoogleApi = baseUrl.includes('googleapis.com');
+
+    const url = isGoogleApi
+        ? `${baseUrl}/v1beta/models/${model}:generateContent?key=${settings.apiKey}`
+        : `${baseUrl}/v1beta/models/${model}:generateContent`;
+
+    let aspectRatio = options.aspectRatio || settings.aspectRatio || '1:1';
+    if (!VALID_ASPECT_RATIOS.includes(aspectRatio)) {
+        iigLog('WARN', `Invalid aspect_ratio "${aspectRatio}", falling back to default`);
+        aspectRatio = VALID_ASPECT_RATIOS.includes(settings.aspectRatio) ? settings.aspectRatio : '1:1';
+    }
+
+    let imageSize = options.imageSize || settings.imageSize || '1K';
+    if (!VALID_IMAGE_SIZES.includes(imageSize)) {
+        iigLog('WARN', `Invalid image_size "${imageSize}", falling back to default`);
+        imageSize = VALID_IMAGE_SIZES.includes(settings.imageSize) ? settings.imageSize : '1K';
+    }
+
+    iigLog('INFO', `Using aspect ratio: ${aspectRatio}, image size: ${imageSize}`);
+
+    const characterRefs = referenceImages.filter(r => !r.label.startsWith('style:'));
+    const styleRefs = referenceImages.filter(r => r.label.startsWith('style:'));
+
+    const parts = [];
+
+    if (characterRefs.length > 0 || styleRefs.length > 0) {
+        let preInstruction = `[IMPORTANT: REFERENCE IMAGES FOLLOW]
+You will receive reference images. Your task is to PRECISELY COPY the appearance of characters shown.
+
+`;
+        if (characterRefs.length > 0) {
+            preInstruction += `CHARACTER REFERENCES (${characterRefs.length} images):
+These images show EXACT appearances you MUST replicate. Do NOT improvise or "improve" their looks.
+`;
+            characterRefs.forEach((ref, i) => {
+                preInstruction += `  - Reference Image ${i + 1}: "${ref.label}"\n`;
+            });
+            preInstruction += `\n`;
+        }
+
+        if (styleRefs.length > 0) {
+            preInstruction += `STYLE REFERENCES (${styleRefs.length} images):
+These define the art style to use. Copy the technique, NOT the content.
+`;
+        }
+
+        parts.push({ text: preInstruction });
+    }
+
+    for (let idx = 0; idx < Math.min(characterRefs.length, 4); idx++) {
+        const ref = characterRefs[idx];
+
+        parts.push({
+            inlineData: {
+                mimeType: ref.mimeType,
+                data: ref.data
+            }
+        });
+
+        parts.push({
+            text: `[REFERENCE IMAGE ${idx + 1}: "${ref.label}"]
+^^^ THIS IS THE EXACT APPEARANCE OF "${ref.label}" ^^^
+MANDATORY: When drawing "${ref.label}", you MUST use:
+• THIS EXACT face shape, eye shape, eye color, nose, mouth, jawline
+• THIS EXACT hair color, hair length, hair style, hair texture
+• THIS EXACT skin tone and complexion
+• THIS EXACT body type and proportions
+DO NOT CHANGE ANYTHING. DO NOT "IMPROVE" OR "STYLIZE" THE FACE.
+COPY THE FACE EXACTLY AS SHOWN IN THIS REFERENCE.
+`
+        });
+    }
+
+    for (const ref of styleRefs.slice(0, 2)) {
+        parts.push({
+            inlineData: {
+                mimeType: ref.mimeType,
+                data: ref.data
+            }
+        });
+
+        const styleName = ref.label.replace('style:', '');
+        parts.push({
+            text: `[STYLE REFERENCE: "${styleName}"]
+^^^ COPY THE ART STYLE FROM THIS IMAGE ^^^
+Replicate: art technique, color palette, linework, shading, lighting approach.
+The CONTENT of this image is irrelevant. Only copy HOW it is drawn.
+`
+        });
+    }
+
+    let fullPrompt = '';
+
+    if (characterRefs.length > 0) {
+        fullPrompt += `[CHARACTER APPEARANCE MAPPING]
+When the following names appear in the scene description, draw them EXACTLY as shown in their reference images:
+`;
+        characterRefs.forEach((ref, i) => {
+            fullPrompt += `• "${ref.label}" = Reference Image ${i + 1} (COPY EXACTLY)\n`;
+        });
+        fullPrompt += `
+CRITICAL RULES:
+1. Face features must be IDENTICAL to references (not "similar" - IDENTICAL)
+2. Hair must match references exactly (color, length, style)
+3. Skin tone must match references exactly
+4. Do NOT add beauty filters or idealize features
+5. If reference shows freckles, scars, or other features - INCLUDE THEM
+
+[END CHARACTER MAPPING]
+
+`;
+    }
+
+    if (styleRefs.length > 0) {
+        fullPrompt += `[STYLE INSTRUCTION]
+Apply the visual style from the style reference(s) to this scene.
+[END STYLE INSTRUCTION]
+
+`;
+    }
+
+    if (style) {
+        fullPrompt += `[Requested Style: ${style}]\n\n`;
+    }
+
+    fullPrompt += `[SCENE TO GENERATE]
+${prompt}
+[END SCENE]`;
+
+    if (characterRefs.length > 0) {
+        fullPrompt += `
+
+[FINAL REMINDER]
+The characters in this scene MUST look EXACTLY like their reference images.
+Check each character's face against their reference before finalizing.`;
+    }
+
+    parts.push({ text: fullPrompt });
+
+    iigLog('INFO', `Gemini request: ${characterRefs.length} char ref(s), ${styleRefs.length} style ref(s), prompt ${fullPrompt.length} chars`);
+    iigLog('INFO', `Parts breakdown: ${parts.map(p => p.text ? `text(${p.text.substring(0, 50)}...)` : `img(${p.inlineData?.mimeType})`).join(' | ')}`);
+
+    const body = {
+        contents: [{
+            role: 'user',
+            parts: parts
+        }],
+        generationConfig: {
+            responseModalities: ['TEXT', 'IMAGE'],
+            imageConfig: {
+                aspectRatio: aspectRatio,
+                imageSize: imageSize
+            }
+        }
+    };
+
+    iigLog('INFO', `Gemini request config: model=${model}, aspectRatio=${aspectRatio}, imageSize=${imageSize}, totalParts=${parts.length}`);
+
+    const headers = { 'Content-Type': 'application/json' };
+    if (!isGoogleApi) {
+        headers['Authorization'] = `Bearer ${settings.apiKey}`;
+    }
+
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(body)
     });
 
-    eventSource.on(event_types.MESSAGE_SENT, async () => {
-      await renderWidget();
-      const s = getSettings();
-      if (!s.flashEnabled || !s.flashChance || flashQueue.length > 0) return;
-      if (Math.random() * 100 < s.flashChance) await triggerFlashback();
+    if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`API Error (${response.status}): ${text}`);
+    }
+
+    const result = await response.json();
+
+    const candidates = result.candidates || [];
+    if (candidates.length === 0) {
+        throw new Error('No candidates in response');
+    }
+
+    const responseParts = candidates[0].content?.parts || [];
+
+    for (const part of responseParts) {
+        if (part.inlineData) {
+            return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+        }
+        if (part.inline_data) {
+            return `data:${part.inline_data.mime_type};base64,${part.inline_data.data}`;
+        }
+    }
+
+    throw new Error('No image found in Gemini response');
+}
+
+function validateSettings() {
+    const settings = getSettings();
+    const errors = [];
+
+    if (!settings.endpoint) {
+        errors.push('URL эндпоинта не настроен');
+    }
+    if (!settings.apiKey) {
+        errors.push('API ключ не настроен');
+    }
+    if (!settings.model) {
+        errors.push('Модель не выбрана');
+    }
+
+    if (errors.length > 0) {
+        throw new Error(`Ошибка настроек: ${errors.join(', ')}`);
+    }
+}
+
+function sanitizeForHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {}) {
+    validateSettings();
+
+    const settings = getSettings();
+    const maxRetries = settings.maxRetries;
+    const baseDelay = settings.retryDelay;
+
+    const referenceImages = [];
+
+    if (settings.sendCharAvatar) {
+        iigLog('INFO', 'Fetching character avatar for reference...');
+        const charAvatar = await getCharacterAvatarBase64();
+        if (charAvatar) {
+            const compressed = await compressImageForReference(charAvatar, 768, 0.85);
+            const charName = SillyTavern.getContext().characters?.[SillyTavern.getContext().characterId]?.name || 'Character';
+            referenceImages.push({
+                data: compressed,
+                label: charName,
+                mimeType: detectMimeType(compressed)
+            });
+            iigLog('INFO', `Character avatar added: "${charName}", ${Math.round(compressed.length / 1024)}KB`);
+        }
+    }
+
+    if (settings.sendUserAvatar) {
+        iigLog('INFO', 'Fetching user avatar for reference...');
+        const userAvatar = await getUserAvatarBase64();
+        if (userAvatar) {
+            const compressed = await compressImageForReference(userAvatar, 768, 0.85);
+            let userName = settings.userCharacterName?.trim();
+            if (!userName) {
+                userName = settings.userAvatarFile?.replace(/\.[^.]+$/, '') || 'User';
+            }
+            referenceImages.push({
+                data: compressed,
+                label: userName,
+                mimeType: detectMimeType(compressed)
+            });
+            iigLog('INFO', `User avatar added: "${userName}", ${Math.round(compressed.length / 1024)}KB`);
+        }
+    }
+
+    if (settings.sendPreviousImage) {
+        iigLog('INFO', 'Fetching previous generated image for reference...');
+        const prevImage = await getLastGeneratedImageBase64();
+        if (prevImage) {
+            referenceImages.push({
+                data: prevImage,
+                label: 'previous_scene',
+                mimeType: detectMimeType(prevImage)
+            });
+            iigLog('INFO', `Previous image added, ${Math.round(prevImage.length / 1024)}KB`);
+        }
+    }
+
+    if (settings.npcReferences && settings.npcReferences.length > 0) {
+        for (const npc of settings.npcReferences) {
+            if (!npc.enabled || !npc.imageData) continue;
+
+            if (nameAppearsInPrompt(npc.name, prompt)) {
+                referenceImages.push({
+                    data: npc.imageData,
+                    label: npc.name,
+                    mimeType: detectMimeType(npc.imageData)
+                });
+                iigLog('INFO', `NPC "${npc.name}" found in prompt, adding reference (${Math.round(npc.imageData.length / 1024)}KB)`);
+            }
+        }
+    }
+
+    if (settings.sendStyleReference && settings.styleReferenceImages?.length > 0) {
+        for (const styleRef of settings.styleReferenceImages) {
+            if (styleRef.imageData) {
+                referenceImages.push({
+                    data: styleRef.imageData,
+                    label: `style:${styleRef.name}`,
+                    mimeType: detectMimeType(styleRef.imageData)
+                });
+                iigLog('INFO', `Style reference "${styleRef.name}" added`);
+            }
+        }
+    }
+
+    iigLog('INFO', `Total reference images: ${referenceImages.length}, labels: [${referenceImages.map(r => r.label).join(', ')}]`);
+
+    let finalStyle = style || '';
+    if (settings.defaultStyle) {
+        finalStyle = settings.defaultStyle + (finalStyle ? ', ' + finalStyle : '');
+        console.log(`[IIG] Using default style: ${settings.defaultStyle}`);
+    }
+
+    let lastError;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            onStatusUpdate?.(`Генерация${attempt > 0 ? ` (повтор ${attempt}/${maxRetries})` : ''}...`);
+
+            if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
+                return await generateImageGemini(prompt, finalStyle, referenceImages, options);
+            } else {
+                return await generateImageOpenAI(prompt, finalStyle, referenceImages, options);
+            }
+        } catch (error) {
+            lastError = error;
+            console.error(`[IIG] Generation attempt ${attempt + 1} failed:`, error);
+
+            const isRetryable = error.message?.includes('429') ||
+                error.message?.includes('503') ||
+                error.message?.includes('502') ||
+                error.message?.includes('504') ||
+                error.message?.includes('timeout') ||
+                error.message?.includes('network');
+
+            if (!isRetryable || attempt === maxRetries) {
+                break;
+            }
+
+            const delay = baseDelay * Math.pow(2, attempt);
+            onStatusUpdate?.(`Повтор через ${delay / 1000}с...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+
+    throw lastError;
+}
+
+async function checkFileExists(path) {
+    try {
+        const response = await fetch(path, { method: 'HEAD' });
+        return response.ok;
+    } catch (e) {
+        return false;
+    }
+}
+
+async function parseImageTags(text, options = {}) {
+    const { checkExistence = false, forceAll = false } = options;
+    const tags = [];
+
+    // --- New format: <img data-iig-instruction='...' ...> ---
+    const imgTagMarker = 'data-iig-instruction=';
+    let searchPos = 0;
+
+    while (true) {
+        const markerPos = text.indexOf(imgTagMarker, searchPos);
+        if (markerPos === -1) break;
+
+        let imgStart = text.lastIndexOf('<img', markerPos);
+        if (imgStart === -1 || markerPos - imgStart > 500) {
+            searchPos = markerPos + 1;
+            continue;
+        }
+
+        const afterMarker = markerPos + imgTagMarker.length;
+        let jsonStart = text.indexOf('{', afterMarker);
+        if (jsonStart === -1 || jsonStart > afterMarker + 10) {
+            searchPos = markerPos + 1;
+            continue;
+        }
+
+        // FIX: Track both single and double quotes in brace counting
+        let braceCount = 0;
+        let jsonEnd = -1;
+        let inString = false;
+        let stringChar = null;
+        let escapeNext = false;
+
+        for (let i = jsonStart; i < text.length; i++) {
+            const char = text[i];
+
+            if (escapeNext) {
+                escapeNext = false;
+                continue;
+            }
+
+            if (char === '\\' && inString) {
+                escapeNext = true;
+                continue;
+            }
+
+            if ((char === '"' || char === "'") && (!inString || char === stringChar)) {
+                if (inString) { inString = false; stringChar = null; }
+                else { inString = true; stringChar = char; }
+                continue;
+            }
+
+            if (!inString) {
+                if (char === '{') {
+                    braceCount++;
+                } else if (char === '}') {
+                    braceCount--;
+                    if (braceCount === 0) {
+                        jsonEnd = i + 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (jsonEnd === -1) {
+            searchPos = markerPos + 1;
+            continue;
+        }
+
+        // FIX: Search for closing > that's not inside a quoted attribute
+        let imgEnd = -1;
+        {
+            let inAttr = false;
+            let attrChar = null;
+            for (let i = jsonEnd; i < text.length; i++) {
+                const c = text[i];
+                if ((c === '"' || c === "'") && (!inAttr || c === attrChar)) {
+                    if (inAttr) { inAttr = false; attrChar = null; }
+                    else { inAttr = true; attrChar = c; }
+                    continue;
+                }
+                if (c === '>' && !inAttr) { imgEnd = i + 1; break; }
+            }
+        }
+
+        const fullImgTag = text.substring(imgStart, imgEnd);
+        const instructionJson = text.substring(jsonStart, jsonEnd);
+
+        const srcMatch = fullImgTag.match(/src\s*=\s*["']?([^"'\s>]+)/i);
+        const srcValue = srcMatch ? srcMatch[1] : '';
+
+        let needsGeneration = false;
+        const hasMarker = srcValue.includes('[IMG:GEN]') || srcValue.includes('[IMG:');
+        const hasErrorImage = srcValue.includes('error.svg');
+        const hasPath = srcValue && srcValue.startsWith('/') && srcValue.length > 5;
+
+        if (hasErrorImage && !forceAll) {
+            iigLog('INFO', `Skipping error image (click to retry): ${srcValue.substring(0, 50)}`);
+            searchPos = imgEnd;
+            continue;
+        }
+
+        if (forceAll) {
+            needsGeneration = true;
+            iigLog('INFO', `Force regeneration mode: including ${srcValue.substring(0, 30)}`);
+        } else if (hasMarker || !srcValue) {
+            needsGeneration = true;
+        } else if (hasPath && checkExistence) {
+            const exists = await checkFileExists(srcValue);
+            if (!exists) {
+                iigLog('WARN', `File does not exist (LLM hallucination?): ${srcValue}`);
+                needsGeneration = true;
+            } else {
+                iigLog('INFO', `Skipping existing image: ${srcValue.substring(0, 50)}`);
+            }
+        } else if (hasPath) {
+            iigLog('INFO', `Skipping path (no existence check): ${srcValue.substring(0, 50)}`);
+            searchPos = imgEnd;
+            continue;
+        }
+
+        if (!needsGeneration) {
+            searchPos = imgEnd;
+            continue;
+        }
+
+        try {
+            let normalizedJson = instructionJson
+                .replace(/&quot;/g, '"')
+                .replace(/&apos;/g, "'")
+                .replace(/&#39;/g, "'")
+                .replace(/&#34;/g, '"')
+                .replace(/\u201c/g, '"')
+                .replace(/\u2018/g, "'")
+                .replace(/\u2019/g, "'")
+                .replace(/\u201d/g, '"')
+                .replace(/&amp;/g, '&');
+
+            // FIX: Try parsing as-is first, then with quote normalization
+            let data;
+            try {
+                data = JSON.parse(normalizedJson);
+            } catch (_) {
+                normalizedJson = normalizedJson.replace(/'/g, '"');
+                data = JSON.parse(normalizedJson);
+            }
+
+            tags.push({
+                fullMatch: fullImgTag,
+                index: imgStart,
+                style: data.style || '',
+                prompt: data.prompt || '',
+                aspectRatio: data.aspect_ratio || data.aspectRatio || null,
+                imageSize: data.image_size || data.imageSize || null,
+                quality: data.quality || null,
+                isNewFormat: true,
+                existingSrc: hasPath ? srcValue : null
+            });
+
+            iigLog('INFO', `Found NEW format tag: ${data.prompt?.substring(0, 50)}`);
+        } catch (e) {
+            iigLog('WARN', `Failed to parse instruction JSON: ${instructionJson.substring(0, 100)}`, e.message);
+        }
+
+        searchPos = imgEnd;
+    }
+
+    // --- Legacy format: [IMG:GEN:{...}] ---
+    const marker = '[IMG:GEN:';
+    let searchStart = 0;
+
+    while (true) {
+        const markerIndex = text.indexOf(marker, searchStart);
+        if (markerIndex === -1) break;
+
+        const jsonStart = markerIndex + marker.length;
+
+        // FIX: Track single quotes too in legacy brace counting
+        let braceCount = 0;
+        let jsonEnd = -1;
+        let inString = false;
+        let stringChar = null;
+        let escapeNext = false;
+
+        for (let i = jsonStart; i < text.length; i++) {
+            const char = text[i];
+
+            if (escapeNext) {
+                escapeNext = false;
+                continue;
+            }
+
+            if (char === '\\' && inString) {
+                escapeNext = true;
+                continue;
+            }
+
+            if ((char === '"' || char === "'") && (!inString || char === stringChar)) {
+                if (inString) { inString = false; stringChar = null; }
+                else { inString = true; stringChar = char; }
+                continue;
+            }
+
+            if (!inString) {
+                if (char === '{') {
+                    braceCount++;
+                } else if (char === '}') {
+                    braceCount--;
+                    if (braceCount === 0) {
+                        jsonEnd = i + 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (jsonEnd === -1) {
+            searchStart = jsonStart;
+            continue;
+        }
+
+        const jsonStr = text.substring(jsonStart, jsonEnd);
+
+        const afterJson = text.substring(jsonEnd);
+        if (!afterJson.startsWith(']')) {
+            searchStart = jsonEnd;
+            continue;
+        }
+
+        const tagOnly = text.substring(markerIndex, jsonEnd + 1);
+
+        try {
+            // FIX: Try parsing as-is first, fallback to single->double quote conversion
+            let data;
+            try {
+                data = JSON.parse(jsonStr);
+            } catch (_) {
+                const normalizedJson = jsonStr.replace(/'/g, '"');
+                data = JSON.parse(normalizedJson);
+            }
+
+            tags.push({
+                fullMatch: tagOnly,
+                index: markerIndex,
+                style: data.style || '',
+                prompt: data.prompt || '',
+                aspectRatio: data.aspect_ratio || data.aspectRatio || null,
+                imageSize: data.image_size || data.imageSize || null,
+                quality: data.quality || null,
+                isNewFormat: false
+            });
+
+            iigLog('INFO', `Found LEGACY format tag: ${data.prompt?.substring(0, 50)}`);
+        } catch (e) {
+            iigLog('WARN', `Failed to parse legacy tag JSON: ${jsonStr.substring(0, 100)}`, e.message);
+        }
+
+        searchStart = jsonEnd + 1;
+    }
+
+    return tags;
+}
+
+function createLoadingPlaceholder(tagId) {
+    const placeholder = document.createElement('div');
+    placeholder.className = 'iig-loading-placeholder';
+    placeholder.dataset.tagId = tagId;
+    placeholder.innerHTML = `
+        <div class="iig-spinner"></div>
+        <div class="iig-status">Генерация картинки...</div>
+    `;
+    return placeholder;
+}
+
+const ERROR_IMAGE_PATH = '/scripts/extensions/third-party/sillyimages/error.svg';
+
+function createErrorPlaceholder(tagId, errorMessage, tagInfo) {
+    const img = document.createElement('img');
+    img.className = 'iig-error-image';
+    img.src = ERROR_IMAGE_PATH;
+    img.alt = 'Ошибка генерации';
+    img.title = `Ошибка: ${errorMessage}`;
+    img.dataset.tagId = tagId;
+
+    if (tagInfo.fullMatch) {
+        const instructionMatch = tagInfo.fullMatch.match(/data-iig-instruction\s*=\s*(['"])([\s\S]*?)\1/i);
+        if (instructionMatch) {
+            img.setAttribute('data-iig-instruction', instructionMatch[2]);
+        }
+    }
+
+    return img;
+}
+
+async function processMessageTags(messageId) {
+    const context = SillyTavern.getContext();
+    const settings = getSettings();
+
+    if (!settings.enabled) return;
+
+    // FIX: Check both active processing AND already completed processing
+    if (processingMessages.has(messageId)) {
+        iigLog('WARN', `Message ${messageId} is already being processed, skipping`);
+        return;
+    }
+
+    if (processedMessages.has(messageId)) {
+        iigLog('INFO', `Message ${messageId} was already processed, skipping`);
+        return;
+    }
+
+    const message = context.chat[messageId];
+    if (!message || message.is_user) return;
+
+    const tags = await parseImageTags(message.mes, { checkExistence: true });
+    iigLog('INFO', `parseImageTags returned: ${tags.length} tags`);
+    if (tags.length > 0) {
+        iigLog('INFO', `First tag: ${JSON.stringify(tags[0]).substring(0, 200)}`);
+    }
+    if (tags.length === 0) {
+        iigLog('INFO', 'No tags found by parser');
+        // FIX: Mark as processed even if no tags found, to prevent re-entry
+        // after DOM changes triggered by other code
+        processedMessages.add(messageId);
+        return;
+    }
+
+    processingMessages.add(messageId);
+    iigLog('INFO', `Found ${tags.length} image tag(s) in message ${messageId}`);
+    toastr.info(`Найдено тегов: ${tags.length}. Генерация...`, 'Генерация картинок', { timeOut: 3000 });
+
+    const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
+    if (!messageElement) {
+        console.error('[IIG] Message element not found for ID:', messageId);
+        toastr.error('Не удалось найти элемент сообщения', 'Генерация картинок');
+        processingMessages.delete(messageId);
+        return;
+    }
+
+    const mesTextEl = messageElement.querySelector('.mes_text');
+    if (!mesTextEl) {
+        processingMessages.delete(messageId);
+        return;
+    }
+
+    const processTag = async (tag, index) => {
+        const tagId = `iig-${messageId}-${index}`;
+
+        iigLog('INFO', `Processing tag ${index}: ${tag.fullMatch.substring(0, 50)}`);
+
+        const loadingPlaceholder = createLoadingPlaceholder(tagId);
+        let targetElement = null;
+
+        if (tag.isNewFormat) {
+            const allImgs = mesTextEl.querySelectorAll('img[data-iig-instruction]');
+            iigLog('INFO', `Searching for img element. Found ${allImgs.length} img[data-iig-instruction] elements in DOM`);
+
+            const searchPrompt = tag.prompt.substring(0, 30);
+            iigLog('INFO', `Searching for prompt starting with: "${searchPrompt}"`);
+
+            for (const img of allImgs) {
+                const instruction = img.getAttribute('data-iig-instruction');
+                const src = img.getAttribute('src') || '';
+                iigLog('INFO', `DOM img - src: "${src.substring(0, 50)}", instruction (first 100): "${instruction?.substring(0, 100)}"`);
+
+                if (instruction) {
+                    const decodedInstruction = instruction
+                        .replace(/&quot;/g, '"')
+                        .replace(/&apos;/g, "'")
+                        .replace(/&#39;/g, "'")
+                        .replace(/&#34;/g, '"')
+                        .replace(/\u201c/g, '"')
+                        .replace(/\u2018/g, "'")
+                        .replace(/\u2019/g, "'")
+                        .replace(/\u201d/g, '"')
+                        .replace(/&amp;/g, '&');
+
+                    const normalizedSearchPrompt = searchPrompt
+                        .replace(/&quot;/g, '"')
+                        .replace(/&apos;/g, "'")
+                        .replace(/&#39;/g, "'")
+                        .replace(/&#34;/g, '"')
+                        .replace(/\u201c/g, '"')
+                        .replace(/\u2018/g, "'")
+                        .replace(/\u2019/g, "'")
+                        .replace(/\u201d/g, '"')
+                        .replace(/&amp;/g, '&');
+
+                    if (decodedInstruction.includes(normalizedSearchPrompt)) {
+                        iigLog('INFO', `Found img element via decoded instruction match`);
+                        targetElement = img;
+                        break;
+                    }
+
+                    try {
+                        const normalizedJson = decodedInstruction.replace(/'/g, '"');
+                        const instructionData = JSON.parse(normalizedJson);
+                        if (instructionData.prompt && instructionData.prompt.substring(0, 30) === tag.prompt.substring(0, 30)) {
+                            iigLog('INFO', `Found img element via JSON prompt match`);
+                            targetElement = img;
+                            break;
+                        }
+                    } catch (e) {
+                        // JSON parse failed, try next method
+                    }
+
+                    if (instruction.includes(searchPrompt)) {
+                        iigLog('INFO', `Found img element via raw instruction match`);
+                        targetElement = img;
+                        break;
+                    }
+                }
+            }
+
+            if (!targetElement) {
+                iigLog('INFO', `Prompt matching failed, trying src marker matching...`);
+                for (const img of allImgs) {
+                    const src = img.getAttribute('src') || '';
+                    if (src.includes('[IMG:GEN]') || src.includes('[IMG:ERROR]') || src === '' || src === '#') {
+                        iigLog('INFO', `Found img element with generation marker in src: "${src}"`);
+                        targetElement = img;
+                        break;
+                    }
+                }
+            }
+
+            if (!targetElement) {
+                iigLog('INFO', `Trying broader img search...`);
+                const allImgsInMes = mesTextEl.querySelectorAll('img');
+                for (const img of allImgsInMes) {
+                    const src = img.getAttribute('src') || '';
+                    if (src.includes('[IMG:GEN]') || src.includes('[IMG:ERROR]')) {
+                        iigLog('INFO', `Found img via broad search with marker src: "${src.substring(0, 50)}"`);
+                        targetElement = img;
+                        break;
+                    }
+                }
+            }
+        } else {
+            const tagEscaped = tag.fullMatch
+                .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                .replace(/\u201c/g, '(?:\u201c|")');
+            const tagRegex = new RegExp(tagEscaped, 'g');
+
+            const beforeReplace = mesTextEl.innerHTML;
+            mesTextEl.innerHTML = mesTextEl.innerHTML.replace(
+                tagRegex,
+                `<span data-iig-placeholder="${tagId}"></span>`
+            );
+
+            if (beforeReplace !== mesTextEl.innerHTML) {
+                targetElement = mesTextEl.querySelector(`[data-iig-placeholder="${tagId}"]`);
+                iigLog('INFO', `Legacy tag replaced with placeholder span`);
+            }
+
+            if (!targetElement) {
+                const allImgs = mesTextEl.querySelectorAll('img');
+                for (const img of allImgs) {
+                    if (img.src && img.src.includes('[IMG:GEN:')) {
+                        targetElement = img;
+                        iigLog('INFO', `Found img with legacy tag in src`);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (targetElement) {
+            const parent = targetElement.parentElement;
+            if (parent) {
+                const parentStyle = window.getComputedStyle(parent);
+                if (parentStyle.display === 'flex' || parentStyle.display === 'grid') {
+                    loadingPlaceholder.style.alignSelf = 'center';
+                }
+            }
+            targetElement.replaceWith(loadingPlaceholder);
+            iigLog('INFO', `Loading placeholder shown (replaced target element)`);
+        } else {
+            iigLog('WARN', `Could not find target element, appending placeholder as fallback`);
+            mesTextEl.appendChild(loadingPlaceholder);
+        }
+
+        const statusEl = loadingPlaceholder.querySelector('.iig-status');
+
+        try {
+            const dataUrl = await generateImageWithRetry(
+                tag.prompt,
+                tag.style,
+                (status) => { statusEl.textContent = status; },
+                { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality }
+            );
+
+            statusEl.textContent = 'Сохранение...';
+            const imagePath = await saveImageToFile(dataUrl);
+
+            const img = document.createElement('img');
+            img.className = 'iig-generated-image';
+            img.src = imagePath;
+            img.alt = tag.prompt;
+            img.title = `Style: ${tag.style}\nPrompt: ${tag.prompt}`;
+
+            if (tag.isNewFormat) {
+                const instructionMatch = tag.fullMatch.match(/data-iig-instruction\s*=\s*(['"])([\s\S]*?)\1/i);
+                if (instructionMatch) {
+                    img.setAttribute('data-iig-instruction', instructionMatch[2]);
+                }
+            }
+
+            loadingPlaceholder.replaceWith(img);
+
+            if (tag.isNewFormat) {
+                const updatedTag = tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${imagePath}"`);
+                message.mes = message.mes.replace(tag.fullMatch, updatedTag);
+            } else {
+                const completionMarker = `[IMG:\u2713:${imagePath}]`;
+                message.mes = message.mes.replace(tag.fullMatch, completionMarker);
+            }
+
+            iigLog('INFO', `Successfully generated image for tag ${index}`);
+            toastr.success(`Картинка ${index + 1}/${tags.length} готова`, 'Генерация картинок', { timeOut: 2000 });
+        } catch (error) {
+            iigLog('ERROR', `Failed to generate image for tag ${index}:`, error.message);
+
+            const errorPlaceholder = createErrorPlaceholder(tagId, error.message, tag);
+            loadingPlaceholder.replaceWith(errorPlaceholder);
+
+            if (tag.isNewFormat) {
+                const errorTag = tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${ERROR_IMAGE_PATH}"`);
+                message.mes = message.mes.replace(tag.fullMatch, errorTag);
+            } else {
+                const errorMarker = `[IMG:ERROR:${error.message.substring(0, 50)}]`;
+                message.mes = message.mes.replace(tag.fullMatch, errorMarker);
+            }
+            iigLog('INFO', `Marked tag as failed in message.mes`);
+
+            toastr.error(`Ошибка генерации: ${error.message}`, 'Генерация картинок');
+        }
+    };
+
+    // FIX: Process tags SEQUENTIALLY instead of in parallel.
+    // Promise.all caused race conditions: multiple tags searching the same DOM
+    // simultaneously would find the same element or miss elements just replaced.
+    try {
+        for (let index = 0; index < tags.length; index++) {
+            await processTag(tags[index], index);
+        }
+    } catch (err) {
+        iigLog('ERROR', `Unexpected error processing tags for message ${messageId}:`, err.message);
+    }
+
+    // FIX: Mark as processed BEFORE saveChat to prevent re-entry from any
+    // DOM events triggered by saving
+    processedMessages.add(messageId);
+
+    // FIX: Only delete from processingMessages AFTER all side-effects are done
+    await context.saveChat();
+    processingMessages.delete(messageId);
+
+    // FIX: REMOVED the call to context.messageFormatting() + mesTextEl.innerHTML assignment.
+    // That was the ROOT CAUSE of the infinite recursion:
+    // messageFormatting -> innerHTML change -> CHARACTER_MESSAGE_RENDERED event
+    // -> onMessageReceived -> processMessageTags -> messageFormatting -> ...
+    // The DOM is already correctly updated by replaceWith() calls above.
+
+    iigLog('INFO', `Finished processing message ${messageId}`);
+}
+
+async function regenerateMessageImages(messageId) {
+    const context = SillyTavern.getContext();
+    const message = context.chat[messageId];
+
+    if (!message) {
+        toastr.error('Сообщение не найдено', 'Генерация картинок');
+        return;
+    }
+
+    const tags = await parseImageTags(message.mes, { forceAll: true });
+
+    if (tags.length === 0) {
+        toastr.warning('Нет тегов для перегенерации', 'Генерация картинок');
+        return;
+    }
+
+    iigLog('INFO', `Regenerating ${tags.length} images in message ${messageId}`);
+    toastr.info(`Перегенерация ${tags.length} картинок...`, 'Генерация картинок');
+
+    // FIX: Remove from processedMessages so it can be marked again after regen
+    processedMessages.delete(messageId);
+    processingMessages.add(messageId);
+
+    const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
+    if (!messageElement) {
+        processingMessages.delete(messageId);
+        return;
+    }
+
+    const mesTextEl = messageElement.querySelector('.mes_text');
+    if (!mesTextEl) {
+        processingMessages.delete(messageId);
+        return;
+    }
+
+    for (let index = 0; index < tags.length; index++) {
+        const tag = tags[index];
+        const tagId = `iig-regen-${messageId}-${index}`;
+
+        try {
+            const existingImg = mesTextEl.querySelector(`img[data-iig-instruction]`);
+            if (existingImg) {
+                const instruction = existingImg.getAttribute('data-iig-instruction');
+
+                const loadingPlaceholder = createLoadingPlaceholder(tagId);
+                existingImg.replaceWith(loadingPlaceholder);
+
+                const statusEl = loadingPlaceholder.querySelector('.iig-status');
+
+                const dataUrl = await generateImageWithRetry(
+                    tag.prompt,
+                    tag.style,
+                    (status) => { statusEl.textContent = status; },
+                    { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality }
+                );
+
+                statusEl.textContent = 'Сохранение...';
+                const imagePath = await saveImageToFile(dataUrl);
+
+                const img = document.createElement('img');
+                img.className = 'iig-generated-image';
+                img.src = imagePath;
+                img.alt = tag.prompt;
+                if (instruction) {
+                    img.setAttribute('data-iig-instruction', instruction);
+                }
+                loadingPlaceholder.replaceWith(img);
+
+                const updatedTag = tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${imagePath}"`);
+                message.mes = message.mes.replace(tag.fullMatch, updatedTag);
+
+                toastr.success(`Картинка ${index + 1}/${tags.length} готова`, 'Генерация картинок', { timeOut: 2000 });
+            }
+        } catch (error) {
+            iigLog('ERROR', `Regeneration failed for tag ${index}:`, error.message);
+            toastr.error(`Ошибка: ${error.message}`, 'Генерация картинок');
+        }
+    }
+
+    processedMessages.add(messageId);
+    processingMessages.delete(messageId);
+    await context.saveChat();
+    iigLog('INFO', `Regeneration complete for message ${messageId}`);
+}
+
+function addRegenerateButton(messageElement, messageId) {
+    if (messageElement.querySelector('.iig-regenerate-btn')) return;
+
+    const extraMesButtons = messageElement.querySelector('.extraMesButtons');
+    if (!extraMesButtons) return;
+
+    const btn = document.createElement('div');
+    btn.className = 'mes_button iig-regenerate-btn fa-solid fa-images interactable';
+    btn.title = 'Перегенерировать картинки';
+    btn.tabIndex = 0;
+    btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await regenerateMessageImages(messageId);
     });
-  }
 
-  // ─── Boot ─────────────────────────────────────────────────────────────────────
+    extraMesButtons.appendChild(btn);
+}
 
-  jQuery(() => {
-    try { wireChatEvents(); console.log('[FMT] v1.3.4 loaded'); }
-    catch (e) { console.error('[FMT] init failed', e); }
-  });
+function addButtonsToExistingMessages() {
+    const context = SillyTavern.getContext();
+    if (!context.chat || context.chat.length === 0) return;
 
+    const messageElements = document.querySelectorAll('#chat .mes');
+    let addedCount = 0;
+
+    for (const messageElement of messageElements) {
+        const mesId = messageElement.getAttribute('mesid');
+        if (mesId === null) continue;
+
+        const messageId = parseInt(mesId, 10);
+        const message = context.chat[messageId];
+
+        if (message && !message.is_user) {
+            addRegenerateButton(messageElement, messageId);
+            addedCount++;
+        }
+    }
+
+    iigLog('INFO', `Added regenerate buttons to ${addedCount} existing messages`);
+}
+
+async function onMessageReceived(messageId) {
+    iigLog('INFO', `onMessageReceived: ${messageId}`);
+
+    const settings = getSettings();
+    if (!settings.enabled) {
+        iigLog('INFO', 'Extension disabled, skipping');
+        return;
+    }
+
+    const context = SillyTavern.getContext();
+    const message = context.chat[messageId];
+
+    const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
+    if (!messageElement) return;
+
+    addRegenerateButton(messageElement, messageId);
+
+    await processMessageTags(messageId);
+}
+
+function renderNpcList() {
+    const settings = getSettings();
+    const container = document.getElementById('iig_npc_list');
+    if (!container) return;
+
+    container.innerHTML = '';
+
+    if (!settings.npcReferences || settings.npcReferences.length === 0) {
+        container.innerHTML = '<p style="color:#5a5252;font-size:11px;">Нет добавленных NPC</p>';
+        return;
+    }
+
+    for (let i = 0; i < settings.npcReferences.length; i++) {
+        const npc = settings.npcReferences[i];
+        const row = document.createElement('div');
+        row.className = 'flex-row';
+        row.style.alignItems = 'center';
+        row.style.gap = '8px';
+        row.style.marginBottom = '6px';
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = npc.enabled !== false;
+        checkbox.addEventListener('change', (e) => {
+            settings.npcReferences[i].enabled = e.target.checked;
+            saveSettings();
+        });
+
+        const nameSpan = document.createElement('span');
+        nameSpan.textContent = npc.name;
+        nameSpan.style.flex = '1';
+        nameSpan.style.color = '#e8e0e0';
+        nameSpan.style.fontSize = '12px';
+
+        const preview = document.createElement('div');
+        preview.style.width = '32px';
+        preview.style.height = '32px';
+        preview.style.borderRadius = '6px';
+        preview.style.overflow = 'hidden';
+        preview.style.flexShrink = '0';
+        if (npc.imageData) {
+            const img = document.createElement('img');
+            img.src = `data:image/jpeg;base64,${npc.imageData}`;
+            img.style.width = '100%';
+            img.style.height = '100%';
+            img.style.objectFit = 'cover';
+            preview.appendChild(img);
+        } else {
+            preview.style.background = '#2a2a2a';
+            preview.style.display = 'flex';
+            preview.style.alignItems = 'center';
+            preview.style.justifyContent = 'center';
+            preview.innerHTML = '<i class="fa-solid fa-user" style="color:#5a5252;font-size:14px;"></i>';
+        }
+
+        const uploadBtn = document.createElement('div');
+        uploadBtn.className = 'menu_button';
+        uploadBtn.title = 'Загрузить картинку';
+        uploadBtn.innerHTML = '<i class="fa-solid fa-upload"></i>';
+        uploadBtn.addEventListener('click', () => {
+            const fileInput = document.createElement('input');
+            fileInput.type = 'file';
+            fileInput.accept = 'image/*';
+            fileInput.addEventListener('change', async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.onload = async (ev) => {
+                    const base64Full = ev.target.result;
+                    const rawBase64 = base64Full.split(',')[1];
+                    try {
+                        const compressed = await compressImageForReference(rawBase64, 768, 0.85);
+                        settings.npcReferences[i].imageData = compressed;
+                        saveSettings();
+                        renderNpcList();
+                        toastr.success(`Картинка для ${npc.name} загружена`, 'NPC');
+                    } catch (err) {
+                        toastr.error('Ошибка сжатия картинки', 'NPC');
+                    }
+                };
+                reader.readAsDataURL(file);
+            });
+            fileInput.click();
+        });
+
+        const deleteBtn = document.createElement('div');
+        deleteBtn.className = 'menu_button';
+        deleteBtn.title = 'Удалить NPC';
+        deleteBtn.innerHTML = '<i class="fa-solid fa-trash"></i>';
+        deleteBtn.style.color = '#cc5555';
+        deleteBtn.addEventListener('click', () => {
+            settings.npcReferences.splice(i, 1);
+            saveSettings();
+            renderNpcList();
+            toastr.info(`NPC "${npc.name}" удалён`, 'NPC');
+        });
+
+        row.appendChild(checkbox);
+        row.appendChild(preview);
+        row.appendChild(nameSpan);
+        row.appendChild(uploadBtn);
+        row.appendChild(deleteBtn);
+        container.appendChild(row);
+    }
+}
+
+function renderStyleRefList() {
+    const settings = getSettings();
+    const container = document.getElementById('iig_style_ref_list');
+    if (!container) return;
+
+    container.innerHTML = '';
+
+    if (!settings.styleReferenceImages || settings.styleReferenceImages.length === 0) {
+        container.innerHTML = '<p style="color:#5a5252;font-size:11px;">Нет загруженных стилей</p>';
+        return;
+    }
+
+    for (let i = 0; i < settings.styleReferenceImages.length; i++) {
+        const styleRef = settings.styleReferenceImages[i];
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.alignItems = 'center';
+        row.style.gap = '8px';
+        row.style.marginBottom = '6px';
+
+        const preview = document.createElement('div');
+        preview.style.width = '48px';
+        preview.style.height = '48px';
+        preview.style.borderRadius = '6px';
+        preview.style.overflow = 'hidden';
+        preview.style.flexShrink = '0';
+        preview.style.border = '1px solid rgba(255,182,193,0.15)';
+        if (styleRef.imageData) {
+            const img = document.createElement('img');
+            img.src = `data:image/jpeg;base64,${styleRef.imageData}`;
+            img.style.width = '100%';
+            img.style.height = '100%';
+            img.style.objectFit = 'cover';
+            preview.appendChild(img);
+        }
+
+        const nameSpan = document.createElement('span');
+        nameSpan.textContent = styleRef.name || `Стиль ${i + 1}`;
+        nameSpan.style.flex = '1';
+        nameSpan.style.color = '#e8e0e0';
+        nameSpan.style.fontSize = '11px';
+
+        const deleteBtn = document.createElement('div');
+        deleteBtn.className = 'menu_button';
+        deleteBtn.title = 'Удалить стилевой референс';
+        deleteBtn.innerHTML = '<i class="fa-solid fa-trash"></i>';
+        deleteBtn.style.color = '#cc5555';
+        deleteBtn.addEventListener('click', () => {
+            settings.styleReferenceImages.splice(i, 1);
+            saveSettings();
+            renderStyleRefList();
+            toastr.info('Стилевой референс удалён', 'Генерация картинок');
+        });
+
+        row.appendChild(preview);
+        row.appendChild(nameSpan);
+        row.appendChild(deleteBtn);
+        container.appendChild(row);
+    }
+}
+
+function updateCharAvatarPreview() {
+    const context = SillyTavern.getContext();
+    const preview = document.getElementById('iig-char-avatar-preview');
+    if (!preview) return;
+    const character = context.characters?.[context.characterId];
+    if (character?.avatar) {
+        const img = preview.querySelector('img');
+        if (img) {
+            img.src = `/thumbnail?type=avatar&file=${encodeURIComponent(character.avatar)}`;
+        }
+        preview.style.display = '';
+    } else {
+        preview.style.display = 'none';
+    }
+}
+
+function renderAvatarDropdown(avatars = []) {
+    const settings = getSettings();
+    const list = document.getElementById('iig_avatar_dropdown_list');
+    if (!list) return;
+
+    list.innerHTML = '';
+
+    const emptyItem = document.createElement('div');
+    emptyItem.className = `iig-avatar-dropdown-item iig-no-avatar ${!settings.userAvatarFile ? 'selected' : ''}`;
+    emptyItem.dataset.value = '';
+    emptyItem.innerHTML = `
+        <div style="width:36px;height:36px;border-radius:5px;background:rgba(255,255,255,0.03);display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+            <i class="fa-solid fa-ban" style="color:#5a5252;font-size:12px;"></i>
+        </div>
+        <span class="iig-item-name">-- Не выбран --</span>
+    `;
+    emptyItem.addEventListener('click', () => selectAvatar('', null));
+    list.appendChild(emptyItem);
+
+    for (const avatarFile of avatars) {
+        const item = document.createElement('div');
+        item.className = `iig-avatar-dropdown-item ${settings.userAvatarFile === avatarFile ? 'selected' : ''}`;
+        item.dataset.value = avatarFile;
+
+        const thumb = document.createElement('img');
+        thumb.className = 'iig-item-thumb';
+        thumb.src = `/User Avatars/${encodeURIComponent(avatarFile)}`;
+        thumb.alt = avatarFile;
+        thumb.loading = 'lazy';
+        thumb.onerror = function () {
+            this.style.display = 'none';
+        };
+
+        const name = document.createElement('span');
+        name.className = 'iig-item-name';
+        name.textContent = avatarFile;
+
+        item.appendChild(thumb);
+        item.appendChild(name);
+
+        item.addEventListener('click', () => selectAvatar(avatarFile, thumb.src));
+        list.appendChild(item);
+    }
+}
+
+async function loadAndRenderAvatars() {
+    try {
+        const avatars = await fetchUserAvatars();
+        renderAvatarDropdown(avatars);
+        iigLog('INFO', `Loaded ${avatars.length} user avatars for dropdown`);
+    } catch (error) {
+        iigLog('ERROR', 'Failed to load avatars for dropdown:', error.message);
+        toastr.error('Ошибка загрузки аватаров', 'Генерация картинок');
+    }
+}
+
+function selectAvatar(avatarFile, thumbSrc) {
+    const settings = getSettings();
+    settings.userAvatarFile = avatarFile;
+    saveSettings();
+
+    const selected = document.getElementById('iig_avatar_dropdown_selected');
+    if (selected) {
+        if (avatarFile) {
+            const safeName = sanitizeForHtml(avatarFile);
+            selected.innerHTML = `
+                <img class="iig-dropdown-thumb" src="/User Avatars/${encodeURIComponent(avatarFile)}" alt="" onerror="this.style.display='none'">
+                <span class="iig-dropdown-text">${safeName}</span>
+                <span class="iig-dropdown-arrow fa-solid fa-chevron-down"></span>
+            `;
+        } else {
+            selected.innerHTML = `
+                <div class="iig-dropdown-placeholder"><i class="fa-solid fa-user"></i></div>
+                <span class="iig-dropdown-text">-- Не выбран --</span>
+                <span class="iig-dropdown-arrow fa-solid fa-chevron-down"></span>
+            `;
+        }
+    }
+
+    const list = document.getElementById('iig_avatar_dropdown_list');
+    if (list) {
+        list.querySelectorAll('.iig-avatar-dropdown-item').forEach(item => {
+            item.classList.toggle('selected', item.dataset.value === avatarFile);
+        });
+    }
+
+    const dropdown = document.getElementById('iig_avatar_dropdown');
+    if (dropdown) dropdown.classList.remove('open');
+
+    iigLog('INFO', `User avatar selected: "${avatarFile}"`);
+}
+
+function createSettingsUI() {
+    const settings = getSettings();
+    const context = SillyTavern.getContext();
+
+    const container = document.getElementById('extensions_settings');
+    if (!container) {
+        console.error('[IIG] Settings container not found');
+        return;
+    }
+
+    const html = `
+        <div class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+                <b>Генерация картинок</b>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
+                <div class="iig-settings">
+                    <label class="checkbox_label">
+                        <input type="checkbox" id="iig_enabled" ${settings.enabled ? 'checked' : ''}>
+                        <span>Включить генерацию картинок</span>
+                    </label>
+
+                    <hr>
+
+                    <h4>Пресеты API</h4>
+                    <p class="hint">Сохраняйте комбинации эндпоинт + ключ + модель для быстрого переключения между прокси.</p>
+
+                    <div id="iig_preset_list"></div>
+
+                    <div class="flex-row" style="margin-top: 8px;">
+                        <input type="text" id="iig_preset_new_name" class="text_pole flex1" placeholder="Название пресета (напр. OpenRouter, Gemini...)">
+                        <div id="iig_preset_save" class="menu_button" title="Сохранить текущие настройки как пресет">
+                            <i class="fa-solid fa-floppy-disk"></i> Сохранить
+                        </div>
+                    </div>
+
+                    <hr>
+
+                    <h4>Настройки API</h4>
+
+                    <div class="flex-row">
+                        <label for="iig_api_type">Тип API</label>
+                        <select id="iig_api_type" class="flex1">
+                            <option value="openai" ${settings.apiType === 'openai' ? 'selected' : ''}>OpenAI-совместимый (/v1/images/generations)</option>
+                            <option value="gemini" ${settings.apiType === 'gemini' ? 'selected' : ''}>Gemini-совместимый (nano-banana)</option>
+                        </select>
+                    </div>
+
+                    <div class="flex-row">
+                        <label for="iig_endpoint">URL эндпоинта</label>
+                        <input type="text" id="iig_endpoint" class="text_pole flex1"
+                               value="${settings.endpoint}"
+                               placeholder="https://api.example.com">
+                    </div>
+
+                    <div class="flex-row">
+                        <label for="iig_api_key">API ключ</label>
+                        <input type="password" id="iig_api_key" class="text_pole flex1"
+                               value="${settings.apiKey}">
+                        <div id="iig_key_toggle" class="menu_button iig-key-toggle" title="Показать/Скрыть">
+                            <i class="fa-solid fa-eye"></i>
+                        </div>
+                    </div>
+
+                    <div class="flex-row">
+                        <label for="iig_model">Модель</label>
+                        <select id="iig_model" class="flex1">
+                            ${settings.model ? `<option value="${settings.model}" selected>${settings.model}</option>` : '<option value="">-- Выберите модель --</option>'}
+                        </select>
+                        <div id="iig_refresh_models" class="menu_button iig-refresh-btn" title="Обновить список">
+                            <i class="fa-solid fa-sync"></i>
+                        </div>
+                    </div>
+
+                    <hr>
+
+                    <h4>Параметры генерации</h4>
+
+                    <div class="flex-row">
+                        <label for="iig_size">Размер</label>
+                        <select id="iig_size" class="flex1">
+                            <option value="1024x1024" ${settings.size === '1024x1024' ? 'selected' : ''}>1024x1024 (Квадрат)</option>
+                            <option value="1792x1024" ${settings.size === '1792x1024' ? 'selected' : ''}>1792x1024 (Альбомная)</option>
+                            <option value="1024x1792" ${settings.size === '1024x1792' ? 'selected' : ''}>1024x1792 (Портретная)</option>
+                            <option value="512x512" ${settings.size === '512x512' ? 'selected' : ''}>512x512 (Маленький)</option>
+                        </select>
+                    </div>
+
+                    <div class="flex-row">
+                        <label for="iig_quality">Качество</label>
+                        <select id="iig_quality" class="flex1">
+                            <option value="standard" ${settings.quality === 'standard' ? 'selected' : ''}>Стандартное</option>
+                            <option value="hd" ${settings.quality === 'hd' ? 'selected' : ''}>HD</option>
+                        </select>
+                    </div>
+
+                    <hr>
+
+                    <h4>Стиль и референсы</h4>
+
+                    <div class="flex-row">
+                        <label for="iig_default_style">Стиль по умолчанию</label>
+                        <textarea id="iig_default_style" class="text_pole flex1" rows="2"
+                                  placeholder="semi_realistic, manhwa style, soft lighting, detailed...">${settings.defaultStyle || ''}</textarea>
+                    </div>
+                    <p class="hint">Добавляется к каждому промпту. Сохраняет одежду, локацию, арт-стиль.</p>
+
+                    <h5>Референсы аватаров</h5>
+                    <p class="hint">Отправлять аватарки для консистентности персонажей.</p>
+
+                    <div class="flex-row" style="align-items:center; gap:8px;">
+                        <label class="checkbox_label" style="flex:1; margin:0;">
+                            <input type="checkbox" id="iig_send_char_avatar" ${settings.sendCharAvatar ? 'checked' : ''}>
+                            <span>Отправлять аватар персонажа</span>
+                        </label>
+                        <div id="iig-char-avatar-preview" class="iig-avatar-preview" style="display:none;">
+                            <img src="" alt="char" />
+                        </div>
+                    </div>
+
+                    <label class="checkbox_label">
+                        <input type="checkbox" id="iig_send_user_avatar" ${settings.sendUserAvatar ? 'checked' : ''}>
+                        <span>Отправлять аватар юзера</span>
+                    </label>
+
+                    <div id="iig_user_avatar_row" class="flex-row ${!settings.sendUserAvatar ? 'hidden' : ''}" style="margin-top: 5px; align-items: center;">
+    <label>Файл аватара</label>
+    <div id="iig_avatar_dropdown" class="iig-avatar-dropdown">
+        <div id="iig_avatar_dropdown_selected" class="iig-avatar-dropdown-selected">
+            ${settings.userAvatarFile
+            ? `<img class="iig-dropdown-thumb" src="/User Avatars/${encodeURIComponent(settings.userAvatarFile)}" alt="" onerror="this.style.display='none'">`
+            : '<div class="iig-dropdown-placeholder"><i class="fa-solid fa-user"></i></div>'}
+            <span class="iig-dropdown-text">${settings.userAvatarFile || '-- Не выбран --'}</span>
+            <span class="iig-dropdown-arrow fa-solid fa-chevron-down"></span>
+        </div>
+        <div id="iig_avatar_dropdown_list" class="iig-avatar-dropdown-list"></div>
+    </div>
+    <div id="iig_refresh_avatars" class="menu_button iig-refresh-btn" title="Обновить список">
+        <i class="fa-solid fa-sync"></i>
+    </div>
+</div>
+
+                    <div id="iig_user_name_row" class="flex-row ${!settings.sendUserAvatar ? 'hidden' : ''}" style="margin-top: 5px;">
+                        <label for="iig_user_char_name">Имя в промптах</label>
+                        <input type="text" id="iig_user_char_name" class="text_pole flex1"
+                               value="${settings.userCharacterName || ''}"
+                               placeholder="Юзер, MC, User...">
+                    </div>
+                    <p id="iig_user_name_hint" class="hint ${!settings.sendUserAvatar ? 'hidden' : ''}">Имя вашего персонажа как оно появляется в промптах генерации (для правильного сопоставления референса).</p>
+
+                    <label class="checkbox_label">
+                        <input type="checkbox" id="iig_send_previous_image" ${settings.sendPreviousImage ? 'checked' : ''}>
+                        <span>Отправлять предыдущую картинку</span>
+                    </label>
+                    <p class="hint">Последняя сгенерированная картинка из чата для сохранения одежды, локации и т.д.</p>
+
+                    <hr>
+
+                    <h5>NPC-референсы</h5>
+                    <p class="hint">Добавьте NPC с именами и картинками. Референс отправляется автоматически, если имя NPC встречается в промпте генерации.</p>
+
+                    <div id="iig_npc_list"></div>
+
+                    <div class="flex-row" style="margin-top: 8px;">
+                        <input type="text" id="iig_npc_new_name" class="text_pole flex1" placeholder="Имя NPC (напр. Luca)">
+                        <div id="iig_npc_add" class="menu_button" title="Добавить NPC">
+                            <i class="fa-solid fa-plus"></i> Добавить
+                        </div>
+                    </div>
+
+                    <hr>
+
+                    <h5>Референс стиля</h5>
+                    <p class="hint">Загрузите картинку-пример стиля. Нанобанана будет копировать визуальный стиль с неё.</p>
+
+                    <label class="checkbox_label">
+                        <input type="checkbox" id="iig_send_style_ref" ${settings.sendStyleReference ? 'checked' : ''}>
+                        <span>Отправлять стилевой референс</span>
+                    </label>
+
+                    <div id="iig_style_ref_container" class="${!settings.sendStyleReference ? 'hidden' : ''}">
+                        <div id="iig_style_ref_list"></div>
+                        <div id="iig_style_ref_upload" class="menu_button" style="width:100%;margin-top:5px;">
+                            <i class="fa-solid fa-palette"></i> Загрузить картинку стиля
+                        </div>
+                    </div>
+
+                    <hr>
+
+                    <div id="iig_gemini_section" class="iig-gemini-section ${settings.apiType !== 'gemini' ? 'hidden' : ''}">
+                        <h4>Настройки Nano-Banana</h4>
+
+                        <div class="flex-row">
+                            <label for="iig_aspect_ratio">Соотношение сторон</label>
+                            <select id="iig_aspect_ratio" class="flex1">
+                                <option value="1:1" ${settings.aspectRatio === '1:1' ? 'selected' : ''}>1:1 (Квадрат)</option>
+                                <option value="2:3" ${settings.aspectRatio === '2:3' ? 'selected' : ''}>2:3 (Портрет)</option>
+                                <option value="3:2" ${settings.aspectRatio === '3:2' ? 'selected' : ''}>3:2 (Альбом)</option>
+                                <option value="3:4" ${settings.aspectRatio === '3:4' ? 'selected' : ''}>3:4 (Портрет)</option>
+                                <option value="4:3" ${settings.aspectRatio === '4:3' ? 'selected' : ''}>4:3 (Альбом)</option>
+                                <option value="4:5" ${settings.aspectRatio === '4:5' ? 'selected' : ''}>4:5 (Портрет)</option>
+                                <option value="5:4" ${settings.aspectRatio === '5:4' ? 'selected' : ''}>5:4 (Альбом)</option>
+                                <option value="9:16" ${settings.aspectRatio === '9:16' ? 'selected' : ''}>9:16 (Вертикальный)</option>
+                                <option value="16:9" ${settings.aspectRatio === '16:9' ? 'selected' : ''}>16:9 (Широкий)</option>
+                                <option value="21:9" ${settings.aspectRatio === '21:9' ? 'selected' : ''}>21:9 (Ультраширокий)</option>
+                            </select>
+                        </div>
+
+                        <div class="flex-row">
+                            <label for="iig_image_size">Разрешение</label>
+                            <select id="iig_image_size" class="flex1">
+                                <option value="1K" ${settings.imageSize === '1K' ? 'selected' : ''}>1K (по умолчанию)</option>
+                                <option value="2K" ${settings.imageSize === '2K' ? 'selected' : ''}>2K</option>
+                                <option value="4K" ${settings.imageSize === '4K' ? 'selected' : ''}>4K</option>
+                            </select>
+                        </div>
+
+                        <hr>
+                    </div>
+
+                    <h4>Обработка ошибок</h4>
+
+                    <div class="flex-row">
+                        <label for="iig_max_retries">Макс. повторов</label>
+                        <input type="number" id="iig_max_retries" class="text_pole flex1"
+                               value="${settings.maxRetries}" min="0" max="5">
+                    </div>
+
+                    <div class="flex-row">
+                        <label for="iig_retry_delay">Задержка (мс)</label>
+                        <input type="number" id="iig_retry_delay" class="text_pole flex1"
+                               value="${settings.retryDelay}" min="500" max="10000" step="500">
+                    </div>
+
+                    <hr>
+
+                    <h4>Отладка</h4>
+
+                    <div class="flex-row">
+                        <div id="iig_export_logs" class="menu_button" style="width: 100%;">
+                            <i class="fa-solid fa-download"></i> Экспорт логов
+                        </div>
+                    </div>
+                    <p class="hint">Экспортировать логи расширения для отладки проблем.</p>
+                </div>
+            </div>
+        </div>
+    `;
+
+    container.insertAdjacentHTML('beforeend', html);
+
+    bindSettingsEvents();
+    updateCharAvatarPreview();
+}
+
+function bindSettingsEvents() {
+    const settings = getSettings();
+
+    document.getElementById('iig_enabled')?.addEventListener('change', (e) => {
+        settings.enabled = e.target.checked;
+        saveSettings();
+    });
+
+    document.getElementById('iig_api_type')?.addEventListener('change', (e) => {
+        settings.apiType = e.target.value;
+        saveSettings();
+
+        const geminiSection = document.getElementById('iig_gemini_section');
+        if (geminiSection) {
+            geminiSection.classList.toggle('hidden', e.target.value !== 'gemini');
+        }
+    });
+
+    document.getElementById('iig_default_style')?.addEventListener('input', (e) => {
+        settings.defaultStyle = e.target.value;
+        saveSettings();
+    });
+
+    document.getElementById('iig_endpoint')?.addEventListener('input', (e) => {
+        settings.endpoint = e.target.value;
+        saveSettings();
+    });
+
+    document.getElementById('iig_api_key')?.addEventListener('input', (e) => {
+        settings.apiKey = e.target.value;
+        saveSettings();
+    });
+
+    document.getElementById('iig_key_toggle')?.addEventListener('click', () => {
+        const input = document.getElementById('iig_api_key');
+        const icon = document.querySelector('#iig_key_toggle i');
+        if (input.type === 'password') {
+            input.type = 'text';
+            icon.classList.replace('fa-eye', 'fa-eye-slash');
+        } else {
+            input.type = 'password';
+            icon.classList.replace('fa-eye-slash', 'fa-eye');
+        }
+    });
+
+    document.getElementById('iig_model')?.addEventListener('change', (e) => {
+        settings.model = e.target.value;
+        saveSettings();
+
+        if (isGeminiModel(e.target.value)) {
+            document.getElementById('iig_api_type').value = 'gemini';
+            settings.apiType = 'gemini';
+            document.getElementById('iig_gemini_section')?.classList.remove('hidden');
+        }
+    });
+
+    document.getElementById('iig_refresh_models')?.addEventListener('click', async (e) => {
+        const btn = e.currentTarget;
+        btn.classList.add('loading');
+
+        try {
+            const models = await fetchModels();
+            const select = document.getElementById('iig_model');
+
+            const currentModel = settings.model;
+
+            select.innerHTML = '<option value="">-- Выберите модель --</option>';
+
+            for (const model of models) {
+                const option = document.createElement('option');
+                option.value = model;
+                option.textContent = model;
+                option.selected = model === currentModel;
+                select.appendChild(option);
+            }
+
+            toastr.success(`Найдено моделей: ${models.length}`, 'Генерация картинок');
+        } catch (error) {
+            toastr.error('Ошибка загрузки моделей', 'Генерация картинок');
+        } finally {
+            btn.classList.remove('loading');
+        }
+    });
+
+    document.getElementById('iig_size')?.addEventListener('change', (e) => {
+        settings.size = e.target.value;
+        saveSettings();
+    });
+
+    document.getElementById('iig_quality')?.addEventListener('change', (e) => {
+        settings.quality = e.target.value;
+        saveSettings();
+    });
+
+    document.getElementById('iig_aspect_ratio')?.addEventListener('change', (e) => {
+        settings.aspectRatio = e.target.value;
+        saveSettings();
+    });
+
+    document.getElementById('iig_image_size')?.addEventListener('change', (e) => {
+        settings.imageSize = e.target.value;
+        saveSettings();
+    });
+
+    document.getElementById('iig_send_char_avatar')?.addEventListener('change', (e) => {
+        settings.sendCharAvatar = e.target.checked;
+        saveSettings();
+    });
+
+    document.getElementById('iig_send_user_avatar')?.addEventListener('change', (e) => {
+        settings.sendUserAvatar = e.target.checked;
+        saveSettings();
+
+        const avatarRow = document.getElementById('iig_user_avatar_row');
+        const nameRow = document.getElementById('iig_user_name_row');
+        const nameHint = document.getElementById('iig_user_name_hint');
+        if (avatarRow) {
+            avatarRow.classList.toggle('hidden', !e.target.checked);
+        }
+        if (nameRow) {
+            nameRow.classList.toggle('hidden', !e.target.checked);
+        }
+        if (nameHint) {
+            nameHint.classList.toggle('hidden', !e.target.checked);
+        }
+    });
+
+    document.getElementById('iig_user_char_name')?.addEventListener('input', (e) => {
+        settings.userCharacterName = e.target.value;
+        saveSettings();
+    });
+
+    document.getElementById('iig_send_previous_image')?.addEventListener('change', (e) => {
+        settings.sendPreviousImage = e.target.checked;
+        saveSettings();
+    });
+
+    document.getElementById('iig_avatar_dropdown_selected')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const dropdown = document.getElementById('iig_avatar_dropdown');
+        if (dropdown) {
+            const wasOpen = dropdown.classList.contains('open');
+            dropdown.classList.toggle('open');
+
+            const list = document.getElementById('iig_avatar_dropdown_list');
+            if (!wasOpen && list && list.children.length === 0) {
+                loadAndRenderAvatars();
+            }
+        }
+    });
+
+    document.addEventListener('click', (e) => {
+        const dropdown = document.getElementById('iig_avatar_dropdown');
+        if (dropdown && !dropdown.contains(e.target)) {
+            dropdown.classList.remove('open');
+        }
+    });
+
+    document.getElementById('iig_refresh_avatars')?.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const btn = e.currentTarget;
+        btn.classList.add('loading');
+        await loadAndRenderAvatars();
+        btn.classList.remove('loading');
+        toastr.success('Аватары обновлены', 'Генерация картинок');
+
+        const dropdown = document.getElementById('iig_avatar_dropdown');
+        if (dropdown) dropdown.classList.add('open');
+    });
+
+    document.getElementById('iig_npc_add')?.addEventListener('click', () => {
+        const nameInput = document.getElementById('iig_npc_new_name');
+        const name = nameInput?.value?.trim();
+
+        if (!name) {
+                        toastr.warning('Введите имя NPC', 'NPC');
+            return;
+        }
+
+        const settings = getSettings();
+        if (!settings.npcReferences) {
+            settings.npcReferences = [];
+        }
+
+        if (settings.npcReferences.some(n => n.name.toLowerCase() === name.toLowerCase())) {
+            toastr.warning(`NPC "${name}" уже существует`, 'NPC');
+            return;
+        }
+
+        settings.npcReferences.push({
+            name: name,
+            imageData: null,
+            enabled: true
+        });
+
+        saveSettings();
+        nameInput.value = '';
+        renderNpcList();
+        toastr.success(`NPC "${name}" добавлен. Загрузите картинку!`, 'NPC');
+    });
+
+    document.getElementById('iig_send_style_ref')?.addEventListener('change', (e) => {
+        settings.sendStyleReference = e.target.checked;
+        saveSettings();
+
+        const styleContainer = document.getElementById('iig_style_ref_container');
+        if (styleContainer) {
+            styleContainer.classList.toggle('hidden', !e.target.checked);
+        }
+    });
+
+    document.getElementById('iig_style_ref_upload')?.addEventListener('click', () => {
+        const fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.accept = 'image/*';
+        fileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = async (ev) => {
+                const base64Full = ev.target.result;
+                const rawBase64 = base64Full.split(',')[1];
+                try {
+                    const compressed = await compressImageForReference(rawBase64, 768, 0.75);
+
+                    if (!settings.styleReferenceImages) {
+                        settings.styleReferenceImages = [];
+                    }
+
+                    const styleName = file.name.replace(/\.[^.]+$/, '') || `style_${Date.now()}`;
+
+                    settings.styleReferenceImages.push({
+                        name: styleName,
+                        imageData: compressed
+                    });
+
+                    saveSettings();
+                    renderStyleRefList();
+                    toastr.success(`Стиль "${styleName}" загружен`, 'Генерация картинок');
+                } catch (err) {
+                    console.error('[IIG] Style ref compression error:', err);
+                    toastr.error('Ошибка сжатия картинки', 'Генерация картинок');
+                }
+            };
+            reader.readAsDataURL(file);
+        });
+        fileInput.click();
+    });
+
+    document.getElementById('iig_max_retries')?.addEventListener('input', (e) => {
+        settings.maxRetries = parseInt(e.target.value) || 0;
+        saveSettings();
+    });
+
+    document.getElementById('iig_retry_delay')?.addEventListener('input', (e) => {
+        settings.retryDelay = parseInt(e.target.value) || 1000;
+        saveSettings();
+    });
+
+    document.getElementById('iig_export_logs')?.addEventListener('click', () => {
+        exportLogs();
+    });
+    document.getElementById('iig_preset_save')?.addEventListener('click', () => {
+        const nameInput = document.getElementById('iig_preset_new_name');
+        const name = nameInput?.value?.trim();
+
+        if (saveCurrentAsPreset(name)) {
+            nameInput.value = '';
+        }
+    });
+
+    // Enter по полю ввода тоже сохраняет
+    document.getElementById('iig_preset_new_name')?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            document.getElementById('iig_preset_save')?.click();
+        }
+    });
+
+    renderPresetList();
+    renderNpcList();
+    renderStyleRefList();
+}
+
+(function init() {
+    const context = SillyTavern.getContext();
+
+    console.log('[IIG] Available event_types:', context.event_types);
+    console.log('[IIG] CHARACTER_MESSAGE_RENDERED:', context.event_types.CHARACTER_MESSAGE_RENDERED);
+    console.log('[IIG] MESSAGE_SWIPED:', context.event_types.MESSAGE_SWIPED);
+
+    getSettings();
+
+    context.eventSource.on(context.event_types.APP_READY, () => {
+        createSettingsUI();
+        addButtonsToExistingMessages();
+        console.log('[IIG] Inline Image Generation extension loaded');
+    });
+
+    context.eventSource.on(context.event_types.CHAT_CHANGED, () => {
+        iigLog('INFO', 'CHAT_CHANGED event - clearing processed cache and adding buttons');
+        // FIX: Clear processedMessages when chat changes so images in new chat can be processed
+        processedMessages.clear();
+        processingMessages.clear();
+        setTimeout(() => {
+            addButtonsToExistingMessages();
+        }, 100);
+        setTimeout(updateCharAvatarPreview, 200);
+    });
+
+    const handleMessage = async (messageId) => {
+        console.log('[IIG] Event triggered for message:', messageId);
+        await onMessageReceived(messageId);
+    };
+
+    context.eventSource.makeLast(context.event_types.CHARACTER_MESSAGE_RENDERED, handleMessage);
+
+    console.log('[IIG] Inline Image Generation extension initialized');
 })();
+
