@@ -1157,6 +1157,10 @@ async function parseImageTags(text, options = {}) {
                 if (c === '>' && !inAttr) { imgEnd = i + 1; break; }
             }
         }
+        if (imgEnd === -1) {
+            searchPos = markerPos + 1;
+            continue;
+        }
 
         const fullImgTag = text.substring(imgStart, imgEnd);
         const instructionJson = text.substring(jsonStart, jsonEnd);
@@ -2638,4 +2642,3 @@ function bindSettingsEvents() {
 
     console.log('[IIG] Inline Image Generation extension initialized');
 })();
-
