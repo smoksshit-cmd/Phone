@@ -72,7 +72,3 @@ All three work together. Draw the characters from character refs, in the style f
 
 {{setvar::largecothtml::
 - HTML Visuals: What additional HTML element could be added that would fit the story? Is the new element varied and different from those used previously?}}
-
-
-
-

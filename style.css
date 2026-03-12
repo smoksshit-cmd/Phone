@@ -185,7 +185,10 @@
 
 /* Regenerate button in message extra menu - inherits mes_button styling */
 
-/* Avatar preview (user & char) — same shape as NPC previews */
+/* ======================================
+   Avatar Preview (char & user)
+   ====================================== */
+
 .iig-avatar-preview {
     width: 32px;
     height: 32px;
@@ -195,12 +198,14 @@
     background: var(--SmartThemeBlurTintColor);
     border: 1px solid rgba(255, 255, 255, 0.1);
 }
+
 .iig-avatar-preview img {
     width: 100%;
     height: 100%;
     object-fit: cover;
     display: block;
 }
+
 /* ======================================
    Custom Avatar Dropdown with Previews
    ====================================== */
@@ -348,4 +353,3 @@
 .iig-avatar-dropdown-list::-webkit-scrollbar-track {
     background: transparent;
 }
-
