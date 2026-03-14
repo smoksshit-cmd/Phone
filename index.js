@@ -4,7 +4,7 @@
  * Catches [IMG:GEN:{json}] tags in AI messages and generates images via configured API.
  * Supports OpenAI-compatible and Gemini-compatible (nano-banana) endpoints.
  *
- * v2.1: NPC system, auto-detection, avatar previews in settings
+ * v2.2: Clothing wardrobe, collapsible settings, NPC enable/disable
  */
 
 const MODULE_NAME = 'inline_image_gen';
@@ -63,6 +63,12 @@ const defaultSettings = Object.freeze({
     clothingSearchDepth: 5,
     npcList: [],
     autoDetectNames: true,
+    // v2.2: Wardrobe
+    wardrobeItems: [],
+    activeWardrobeChar: null,
+    activeWardrobeUser: null,
+    // v2.2: Collapsible section states
+    collapsedSections: {},
 });
 
 const IMAGE_MODEL_KEYWORDS = [
@@ -209,9 +215,6 @@ async function getCharacterAvatarBase64() {
     }
 }
 
-/**
- * Get character avatar URL for preview display
- */
 function getCharacterAvatarUrl() {
     try {
         const context = SillyTavern.getContext();
@@ -241,9 +244,6 @@ async function getUserAvatarBase64() {
     }
 }
 
-/**
- * Get user avatar URL for preview display
- */
 function getUserAvatarUrl() {
     const settings = getSettings();
     if (!settings.userAvatarFile) return null;
@@ -281,6 +281,53 @@ async function resizeImageBase64(base64, maxSize = 512) {
 }
 
 // ============================================================
+// WARDROBE SYSTEM
+// ============================================================
+
+function generateWardrobeId() {
+    return 'ward_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+}
+
+function addWardrobeItem(name, imageData, target = 'char') {
+    const settings = getSettings();
+    const item = {
+        id: generateWardrobeId(),
+        name: name || 'Outfit',
+        imageData,
+        target, // 'char' or 'user'
+        createdAt: Date.now(),
+    };
+    settings.wardrobeItems.push(item);
+    saveSettings();
+    return item;
+}
+
+function removeWardrobeItem(itemId) {
+    const settings = getSettings();
+    if (settings.activeWardrobeChar === itemId) settings.activeWardrobeChar = null;
+    if (settings.activeWardrobeUser === itemId) settings.activeWardrobeUser = null;
+    settings.wardrobeItems = settings.wardrobeItems.filter(w => w.id !== itemId);
+    saveSettings();
+}
+
+function setActiveWardrobe(itemId, target) {
+    const settings = getSettings();
+    if (target === 'char') {
+        settings.activeWardrobeChar = settings.activeWardrobeChar === itemId ? null : itemId;
+    } else {
+        settings.activeWardrobeUser = settings.activeWardrobeUser === itemId ? null : itemId;
+    }
+    saveSettings();
+}
+
+function getActiveWardrobeItem(target) {
+    const settings = getSettings();
+    const activeId = target === 'char' ? settings.activeWardrobeChar : settings.activeWardrobeUser;
+    if (!activeId) return null;
+    return settings.wardrobeItems.find(w => w.id === activeId) || null;
+}
+
+// ============================================================
 // NAME DETECTION IN PROMPT
 // ============================================================
 
@@ -297,7 +344,7 @@ function detectMentionedCharacters(prompt) {
     if (userName && lowerPrompt.includes(userName.toLowerCase())) result.userMentioned = true;
 
     for (const npc of (settings.npcList || [])) {
-        if (!npc.name) continue;
+        if (!npc.name || npc.enabled === false) continue;
         const names = [npc.name, ...(npc.aliases || [])].filter(Boolean);
         for (const name of names) {
             if (lowerPrompt.includes(name.toLowerCase())) { result.npcIds.push(npc.id); break; }
@@ -334,8 +381,30 @@ async function collectReferenceImages(prompt) {
 
     for (const npcId of mentions.npcIds) {
         const npc = settings.npcList.find(n => n.id === npcId);
-        if (!npc?.avatarData) continue;
+        if (!npc?.avatarData || npc.enabled === false) continue;
         references.push({ base64: npc.avatarData, label: `Reference image of ${npc.name}`, name: npc.name });
+    }
+
+    // Wardrobe clothing references
+    const charWardrobeItem = getActiveWardrobeItem('char');
+    if (charWardrobeItem?.imageData) {
+        const context = SillyTavern.getContext();
+        const charName = context.characters?.[context.characterId]?.name || 'Character';
+        references.push({
+            base64: charWardrobeItem.imageData,
+            label: `Clothing reference for ${charName}: "${charWardrobeItem.name}". ${charName} MUST be wearing exactly this outfit.`,
+            name: `${charName}'s outfit`,
+        });
+    }
+    const userWardrobeItem = getActiveWardrobeItem('user');
+    if (userWardrobeItem?.imageData) {
+        const context = SillyTavern.getContext();
+        const userName = context.name1 || 'User';
+        references.push({
+            base64: userWardrobeItem.imageData,
+            label: `Clothing reference for ${userName}: "${userWardrobeItem.name}". ${userName} MUST be wearing exactly this outfit.`,
+            name: `${userName}'s outfit`,
+        });
     }
 
     iigLog('INFO', `Total reference images: ${references.length}`);
@@ -472,7 +541,7 @@ function extractUserAppearance() {
 function getNpcAppearance(npcId) {
     const settings = getSettings();
     const npc = settings.npcList.find(n => n.id === npcId);
-    if (!npc?.appearance) return null;
+    if (!npc?.appearance || npc.enabled === false) return null;
     return `${npc.name}'s appearance: ${npc.appearance}`;
 }
 
@@ -580,6 +649,18 @@ function buildEnhancedPrompt(basePrompt, style, options = {}) {
     if (settings.detectClothing === true) {
         const clothing = detectClothingFromChat(settings.clothingSearchDepth || 5);
         if (clothing) promptParts.push(`[Current Clothing: ${clothing}]`);
+    }
+
+    // Wardrobe clothing instructions
+    const charWardrobeItem = getActiveWardrobeItem('char');
+    if (charWardrobeItem) {
+        const charName = context.characters?.[context.characterId]?.name || 'Character';
+        promptParts.push(`[CLOTHING OVERRIDE for ${charName}: The character MUST be wearing the outfit shown in the clothing reference image "${charWardrobeItem.name}". Ignore any other clothing descriptions — use ONLY the referenced outfit.]`);
+    }
+    const userWardrobeItem = getActiveWardrobeItem('user');
+    if (userWardrobeItem) {
+        const userName = context.name1 || 'User';
+        promptParts.push(`[CLOTHING OVERRIDE for ${userName}: This person MUST be wearing the outfit shown in the clothing reference image "${userWardrobeItem.name}". Ignore any other clothing descriptions — use ONLY the referenced outfit.]`);
     }
 
     if (options._referenceLabels?.length > 0) {
@@ -1052,7 +1133,7 @@ function generateNpcId() {
 
 function addNpc() {
     const settings = getSettings();
-    const npc = { id: generateNpcId(), name: '', aliases: [], avatarData: null, appearance: '' };
+    const npc = { id: generateNpcId(), name: '', aliases: [], avatarData: null, appearance: '', enabled: true };
     settings.npcList.push(npc);
     saveSettings();
     return npc;
@@ -1070,17 +1151,55 @@ function updateNpc(npcId, updates) {
     if (npc) { Object.assign(npc, updates); saveSettings(); }
 }
 
+function toggleNpc(npcId) {
+    const settings = getSettings();
+    const npc = settings.npcList.find(n => n.id === npcId);
+    if (npc) {
+        npc.enabled = npc.enabled === false ? true : false;
+        saveSettings();
+    }
+    return npc;
+}
+
+// ============================================================
+// COLLAPSIBLE SECTION HELPER
+// ============================================================
+
+function isSectionCollapsed(sectionId) {
+    const settings = getSettings();
+    return settings.collapsedSections?.[sectionId] === true;
+}
+
+function toggleSectionCollapsed(sectionId) {
+    const settings = getSettings();
+    if (!settings.collapsedSections) settings.collapsedSections = {};
+    settings.collapsedSections[sectionId] = !settings.collapsedSections[sectionId];
+    saveSettings();
+}
+
+function createCollapsibleSection(id, icon, title, contentHtml) {
+    const collapsed = isSectionCollapsed(id);
+    return `
+        <div class="iig-section" data-section-id="${id}">
+            <div class="iig-section-header" data-section-toggle="${id}">
+                <span class="iig-section-icon">${icon}</span>
+                <span class="iig-section-title">${title}</span>
+                <i class="fa-solid fa-chevron-down iig-section-chevron ${collapsed ? 'iig-collapsed' : ''}"></i>
+            </div>
+            <div class="iig-section-body ${collapsed ? 'iig-section-hidden' : ''}">
+                ${contentHtml}
+            </div>
+        </div>
+    `;
+}
+
 // ============================================================
 // AVATAR PREVIEW UPDATES
 // ============================================================
 
-/**
- * Update the character avatar preview in settings UI
- */
 function updateCharAvatarPreview() {
     const previewEl = document.getElementById('iig_char_avatar_preview');
     if (!previewEl) return;
-
     const avatarUrl = getCharacterAvatarUrl();
     if (avatarUrl) {
         previewEl.innerHTML = `<img src="${avatarUrl}" class="iig-avatar-preview-img" alt="Аватар персонажа">`;
@@ -1089,19 +1208,68 @@ function updateCharAvatarPreview() {
     }
 }
 
-/**
- * Update the user avatar preview in settings UI
- */
 function updateUserAvatarPreview() {
     const previewEl = document.getElementById('iig_user_avatar_preview');
     if (!previewEl) return;
-
     const avatarUrl = getUserAvatarUrl();
     if (avatarUrl) {
         previewEl.innerHTML = `<img src="${avatarUrl}" class="iig-avatar-preview-img" alt="Аватар юзера">`;
     } else {
         previewEl.innerHTML = `<div class="iig-avatar-preview-empty"><i class="fa-solid fa-user"></i><span>Не выбран</span></div>`;
     }
+}
+
+// ============================================================
+// WARDROBE UI
+// ============================================================
+
+function renderWardrobeGrid(target) {
+    const settings = getSettings();
+    const containerId = target === 'char' ? 'iig_wardrobe_char' : 'iig_wardrobe_user';
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    const items = settings.wardrobeItems.filter(w => w.target === target);
+    const activeId = target === 'char' ? settings.activeWardrobeChar : settings.activeWardrobeUser;
+
+    if (items.length === 0) {
+        container.innerHTML = `<div class="iig-wardrobe-empty">Нет одежды. Нажмите + чтобы добавить.</div>`;
+        return;
+    }
+
+    container.innerHTML = items.map(item => `
+        <div class="iig-wardrobe-card ${item.id === activeId ? 'iig-wardrobe-active' : ''}" data-ward-id="${item.id}" data-ward-target="${target}">
+            <img src="data:image/png;base64,${item.imageData}" class="iig-wardrobe-img" alt="${item.name}">
+            <div class="iig-wardrobe-card-overlay">
+                <span class="iig-wardrobe-card-name" title="${item.name}">${item.name}</span>
+                <div class="iig-wardrobe-card-actions">
+                    <i class="fa-solid fa-trash iig-wardrobe-delete" data-ward-del="${item.id}" title="Удалить"></i>
+                </div>
+            </div>
+            ${item.id === activeId ? '<div class="iig-wardrobe-check"><i class="fa-solid fa-check"></i></div>' : ''}
+        </div>
+    `).join('');
+
+    // Bind events
+    container.querySelectorAll('.iig-wardrobe-card').forEach(card => {
+        card.addEventListener('click', (e) => {
+            if (e.target.closest('.iig-wardrobe-delete')) return;
+            const wardId = card.dataset.wardId;
+            const wardTarget = card.dataset.wardTarget;
+            setActiveWardrobe(wardId, wardTarget);
+            renderWardrobeGrid(wardTarget);
+        });
+    });
+
+    container.querySelectorAll('.iig-wardrobe-delete').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const wardId = btn.dataset.wardDel;
+            removeWardrobeItem(wardId);
+            renderWardrobeGrid(target);
+            toastr.info('Одежда удалена');
+        });
+    });
 }
 
 // ============================================================
@@ -1115,8 +1283,9 @@ function renderNpcList() {
     container.innerHTML = '';
 
     for (const npc of settings.npcList) {
+        const isEnabled = npc.enabled !== false;
         const npcEl = document.createElement('div');
-        npcEl.className = 'iig-npc-item';
+        npcEl.className = `iig-npc-item ${!isEnabled ? 'iig-npc-disabled' : ''}`;
         npcEl.dataset.npcId = npc.id;
 
         const avatarPreview = npc.avatarData
@@ -1134,7 +1303,12 @@ function renderNpcList() {
                     <input type="text" class="text_pole iig-npc-name" placeholder="Имя NPC" value="${npc.name || ''}">
                     <input type="text" class="text_pole iig-npc-aliases" placeholder="Алиасы (через запятую)" value="${(npc.aliases || []).join(', ')}">
                 </div>
-                <div class="iig-npc-remove menu_button" title="Удалить NPC"><i class="fa-solid fa-trash"></i></div>
+                <div class="iig-npc-btn-group">
+                    <div class="iig-npc-toggle menu_button ${isEnabled ? 'iig-npc-on' : 'iig-npc-off'}" title="${isEnabled ? 'Выключить NPC' : 'Включить NPC'}">
+                        <i class="fa-solid ${isEnabled ? 'fa-toggle-on' : 'fa-toggle-off'}"></i>
+                    </div>
+                    <div class="iig-npc-remove menu_button" title="Удалить NPC"><i class="fa-solid fa-trash"></i></div>
+                </div>
             </div>
             <textarea class="text_pole iig-npc-appearance" rows="2" placeholder="Описание внешности (опционально)">${npc.appearance || ''}</textarea>
         `;
@@ -1144,6 +1318,12 @@ function renderNpcList() {
             updateNpc(npc.id, { aliases: e.target.value.split(',').map(a => a.trim()).filter(Boolean) });
         });
         npcEl.querySelector('.iig-npc-appearance').addEventListener('input', (e) => updateNpc(npc.id, { appearance: e.target.value }));
+
+        // Toggle NPC on/off
+        npcEl.querySelector('.iig-npc-toggle').addEventListener('click', () => {
+            toggleNpc(npc.id);
+            renderNpcList();
+        });
 
         const uploadBtn = npcEl.querySelector('.iig-npc-avatar-upload-btn');
         const fileInput = npcEl.querySelector('.iig-npc-avatar-input');
@@ -1179,6 +1359,183 @@ function createSettingsUI() {
     const container = document.getElementById('extensions_settings');
     if (!container) return;
 
+    // Build section contents
+    const apiSectionContent = `
+        <div class="flex-row">
+            <label for="iig_api_type">Тип API</label>
+            <select id="iig_api_type" class="flex1">
+                <option value="openai" ${settings.apiType === 'openai' ? 'selected' : ''}>OpenAI-совместимый</option>
+                <option value="gemini" ${settings.apiType === 'gemini' ? 'selected' : ''}>Gemini-совместимый (nano-banana)</option>
+            </select>
+        </div>
+        <div class="flex-row">
+            <label for="iig_endpoint">URL эндпоинта</label>
+            <input type="text" id="iig_endpoint" class="text_pole flex1" value="${settings.endpoint}" placeholder="https://api.example.com">
+        </div>
+        <div class="flex-row">
+            <label for="iig_api_key">API ключ</label>
+            <input type="password" id="iig_api_key" class="text_pole flex1" value="${settings.apiKey}">
+            <div id="iig_key_toggle" class="menu_button iig-key-toggle" title="Показать/Скрыть"><i class="fa-solid fa-eye"></i></div>
+        </div>
+        <div class="flex-row">
+            <label for="iig_model">Модель</label>
+            <select id="iig_model" class="flex1">
+                ${settings.model ? `<option value="${settings.model}" selected>${settings.model}</option>` : '<option value="">-- Выберите --</option>'}
+            </select>
+            <div id="iig_refresh_models" class="menu_button iig-refresh-btn" title="Обновить"><i class="fa-solid fa-sync"></i></div>
+        </div>
+    `;
+
+    const genParamsSectionContent = `
+        <div class="flex-row">
+            <label for="iig_size">Размер (OpenAI)</label>
+            <select id="iig_size" class="flex1">
+                <option value="1024x1024" ${settings.size === '1024x1024' ? 'selected' : ''}>1024x1024</option>
+                <option value="1792x1024" ${settings.size === '1792x1024' ? 'selected' : ''}>1792x1024</option>
+                <option value="1024x1792" ${settings.size === '1024x1792' ? 'selected' : ''}>1024x1792</option>
+                <option value="512x512" ${settings.size === '512x512' ? 'selected' : ''}>512x512</option>
+            </select>
+        </div>
+        <div class="flex-row">
+            <label for="iig_quality">Качество</label>
+            <select id="iig_quality" class="flex1">
+                <option value="standard" ${settings.quality === 'standard' ? 'selected' : ''}>Стандартное</option>
+                <option value="hd" ${settings.quality === 'hd' ? 'selected' : ''}>HD</option>
+            </select>
+        </div>
+        <div class="flex-row">
+            <label for="iig_aspect_ratio">Соотношение сторон</label>
+            <select id="iig_aspect_ratio" class="flex1">
+                ${VALID_ASPECT_RATIOS.map(r => `<option value="${r}" ${settings.aspectRatio === r ? 'selected' : ''}>${r}</option>`).join('')}
+            </select>
+        </div>
+        <div class="flex-row">
+            <label for="iig_image_size">Разрешение</label>
+            <select id="iig_image_size" class="flex1">
+                ${VALID_IMAGE_SIZES.map(s => `<option value="${s}" ${settings.imageSize === s ? 'selected' : ''}>${s}</option>`).join('')}
+            </select>
+        </div>
+    `;
+
+    const referencesSectionContent = `
+        <label class="checkbox_label">
+            <input type="checkbox" id="iig_auto_detect_names" ${settings.autoDetectNames ? 'checked' : ''}>
+            <span>Автоопределение имён в промпте</span>
+        </label>
+        <p class="hint">Если имя персонажа/юзера/NPC упомянуто — аватарка автоматически добавится как референс.</p>
+
+        <label class="checkbox_label">
+            <input type="checkbox" id="iig_send_char_avatar" ${settings.sendCharAvatar ? 'checked' : ''}>
+            <span>Всегда отправлять аватар персонажа</span>
+        </label>
+        <div id="iig_char_avatar_preview" class="iig-avatar-preview-container">
+            <div class="iig-avatar-preview-empty"><i class="fa-solid fa-user"></i><span>Нет аватара</span></div>
+        </div>
+
+        <label class="checkbox_label">
+            <input type="checkbox" id="iig_send_user_avatar" ${settings.sendUserAvatar ? 'checked' : ''}>
+            <span>Всегда отправлять аватар юзера</span>
+        </label>
+        <div id="iig_user_avatar_row" class="flex-row ${!settings.sendUserAvatar ? 'hidden' : ''}" style="margin-top: 5px; align-items: center;">
+            <label for="iig_user_avatar_file">Аватар юзера</label>
+            <select id="iig_user_avatar_file" class="flex1">
+                <option value="">-- Не выбран --</option>
+                ${settings.userAvatarFile ? `<option value="${settings.userAvatarFile}" selected>${settings.userAvatarFile}</option>` : ''}
+            </select>
+            <div id="iig_refresh_avatars" class="menu_button iig-refresh-btn" title="Обновить"><i class="fa-solid fa-sync"></i></div>
+        </div>
+        <div id="iig_user_avatar_preview" class="iig-avatar-preview-container ${!settings.sendUserAvatar ? 'hidden' : ''}">
+            <div class="iig-avatar-preview-empty"><i class="fa-solid fa-user"></i><span>Не выбран</span></div>
+        </div>
+    `;
+
+    const wardrobeSectionContent = `
+        <p class="hint">Загрузите картинки с одеждой. Выбранная одежда будет отправлена как референс — модель оденет персонажа в неё.</p>
+
+        <h5 style="margin: 6px 0 4px;">Одежда персонажа</h5>
+        <div id="iig_wardrobe_char" class="iig-wardrobe-grid"></div>
+        <div class="iig-wardrobe-add-row">
+            <input type="text" id="iig_wardrobe_char_name" class="text_pole flex1" placeholder="Название наряда">
+            <input type="file" id="iig_wardrobe_char_file" accept="image/*" style="display:none;">
+            <div id="iig_wardrobe_char_add" class="menu_button" title="Добавить одежду"><i class="fa-solid fa-plus"></i> Добавить</div>
+        </div>
+
+        <h5 style="margin: 10px 0 4px;">Одежда юзера</h5>
+        <div id="iig_wardrobe_user" class="iig-wardrobe-grid"></div>
+        <div class="iig-wardrobe-add-row">
+            <input type="text" id="iig_wardrobe_user_name" class="text_pole flex1" placeholder="Название наряда">
+            <input type="file" id="iig_wardrobe_user_file" accept="image/*" style="display:none;">
+            <div id="iig_wardrobe_user_add" class="menu_button" title="Добавить одежду"><i class="fa-solid fa-plus"></i> Добавить</div>
+        </div>
+    `;
+
+    const npcSectionContent = `
+        <p class="hint">Добавьте NPC с аватарками. При упоминании имени в промпте аватарка будет использована как референс.</p>
+        <div id="iig_npc_list"></div>
+        <div id="iig_add_npc" class="menu_button" style="width: 100%; margin-top: 8px;">
+            <i class="fa-solid fa-plus"></i> Добавить NPC
+        </div>
+    `;
+
+    const promptsSectionContent = `
+        <p class="hint">Positive добавляется в начало, Negative — как инструкция избегания.</p>
+        <div class="flex-col" style="margin-bottom: 8px;">
+            <label for="iig_positive_prompt">Positive промпт</label>
+            <textarea id="iig_positive_prompt" class="text_pole" rows="2" placeholder="masterpiece, best quality...">${settings.positivePrompt || ''}</textarea>
+        </div>
+        <div class="flex-col" style="margin-bottom: 8px;">
+            <label for="iig_negative_prompt">Negative промпт</label>
+            <textarea id="iig_negative_prompt" class="text_pole" rows="2" placeholder="low quality, blurry...">${settings.negativePrompt || ''}</textarea>
+        </div>
+    `;
+
+    const styleSectionContent = `
+        <label class="checkbox_label">
+            <input type="checkbox" id="iig_fixed_style_enabled" ${settings.fixedStyleEnabled ? 'checked' : ''}>
+            <span>Включить фиксированный стиль</span>
+        </label>
+        <div class="flex-col" style="margin-top: 5px;">
+            <label for="iig_fixed_style">Стиль</label>
+            <input type="text" id="iig_fixed_style" class="text_pole" value="${settings.fixedStyle || ''}" placeholder="Anime semi-realistic style...">
+        </div>
+    `;
+
+    const extractionSectionContent = `
+        <label class="checkbox_label">
+            <input type="checkbox" id="iig_extract_appearance" ${settings.extractAppearance ? 'checked' : ''}>
+            <span>Из карточки персонажа</span>
+        </label>
+        <label class="checkbox_label">
+            <input type="checkbox" id="iig_extract_user_appearance" ${settings.extractUserAppearance !== false ? 'checked' : ''}>
+            <span>Из персоны юзера</span>
+        </label>
+        <label class="checkbox_label">
+            <input type="checkbox" id="iig_detect_clothing" ${settings.detectClothing ? 'checked' : ''}>
+            <span>Определять одежду из чата</span>
+        </label>
+        <div class="flex-row" style="margin-top: 5px;">
+            <label for="iig_clothing_depth">Глубина поиска</label>
+            <input type="number" id="iig_clothing_depth" class="text_pole flex1" value="${settings.clothingSearchDepth || 5}" min="1" max="20">
+        </div>
+    `;
+
+    const errorSectionContent = `
+        <div class="flex-row">
+            <label for="iig_max_retries">Макс. повторов</label>
+            <input type="number" id="iig_max_retries" class="text_pole flex1" value="${settings.maxRetries}" min="0" max="5">
+        </div>
+        <div class="flex-row">
+            <label for="iig_retry_delay">Задержка (мс)</label>
+            <input type="number" id="iig_retry_delay" class="text_pole flex1" value="${settings.retryDelay}" min="500" max="10000" step="500">
+        </div>
+    `;
+
+    const debugSectionContent = `
+        <div class="flex-row">
+            <div id="iig_export_logs" class="menu_button" style="width: 100%;"><i class="fa-solid fa-download"></i> Экспорт логов</div>
+        </div>
+    `;
+
     const html = `
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
@@ -1192,200 +1549,40 @@ function createSettingsUI() {
                         <span>Включить генерацию картинок</span>
                     </label>
 
-                    <hr>
-                    <h4>Настройки API</h4>
-
-                    <div class="flex-row">
-                        <label for="iig_api_type">Тип API</label>
-                        <select id="iig_api_type" class="flex1">
-                            <option value="openai" ${settings.apiType === 'openai' ? 'selected' : ''}>OpenAI-совместимый</option>
-                            <option value="gemini" ${settings.apiType === 'gemini' ? 'selected' : ''}>Gemini-совместимый (nano-banana)</option>
-                        </select>
-                    </div>
-
-                    <div class="flex-row">
-                        <label for="iig_endpoint">URL эндпоинта</label>
-                        <input type="text" id="iig_endpoint" class="text_pole flex1" value="${settings.endpoint}" placeholder="https://api.example.com">
-                    </div>
-
-                    <div class="flex-row">
-                        <label for="iig_api_key">API ключ</label>
-                        <input type="password" id="iig_api_key" class="text_pole flex1" value="${settings.apiKey}">
-                        <div id="iig_key_toggle" class="menu_button iig-key-toggle" title="Показать/Скрыть"><i class="fa-solid fa-eye"></i></div>
-                    </div>
-
-                    <div class="flex-row">
-                        <label for="iig_model">Модель</label>
-                        <select id="iig_model" class="flex1">
-                            ${settings.model ? `<option value="${settings.model}" selected>${settings.model}</option>` : '<option value="">-- Выберите --</option>'}
-                        </select>
-                        <div id="iig_refresh_models" class="menu_button iig-refresh-btn" title="Обновить"><i class="fa-solid fa-sync"></i></div>
-                    </div>
-
-                    <hr>
-                    <h4>Параметры генерации</h4>
-
-                    <div class="flex-row">
-                        <label for="iig_size">Размер (OpenAI)</label>
-                        <select id="iig_size" class="flex1">
-                            <option value="1024x1024" ${settings.size === '1024x1024' ? 'selected' : ''}>1024x1024</option>
-                            <option value="1792x1024" ${settings.size === '1792x1024' ? 'selected' : ''}>1792x1024</option>
-                            <option value="1024x1792" ${settings.size === '1024x1792' ? 'selected' : ''}>1024x1792</option>
-                            <option value="512x512" ${settings.size === '512x512' ? 'selected' : ''}>512x512</option>
-                        </select>
-                    </div>
-
-                    <div class="flex-row">
-                        <label for="iig_quality">Качество</label>
-                        <select id="iig_quality" class="flex1">
-                            <option value="standard" ${settings.quality === 'standard' ? 'selected' : ''}>Стандартное</option>
-                            <option value="hd" ${settings.quality === 'hd' ? 'selected' : ''}>HD</option>
-                        </select>
-                    </div>
-
-                    <hr>
-
-                    <div id="iig_avatar_section" class="iig-avatar-section ${settings.apiType !== 'gemini' ? 'hidden' : ''}">
-                        <h4>Настройки Nano-Banana</h4>
-
-                        <div class="flex-row">
-                            <label for="iig_aspect_ratio">Соотношение сторон</label>
-                            <select id="iig_aspect_ratio" class="flex1">
-                                ${VALID_ASPECT_RATIOS.map(r => `<option value="${r}" ${settings.aspectRatio === r ? 'selected' : ''}>${r}</option>`).join('')}
-                            </select>
-                        </div>
-
-                        <div class="flex-row">
-                            <label for="iig_image_size">Разрешение</label>
-                            <select id="iig_image_size" class="flex1">
-                                ${VALID_IMAGE_SIZES.map(s => `<option value="${s}" ${settings.imageSize === s ? 'selected' : ''}>${s}</option>`).join('')}
-                            </select>
-                        </div>
-
-                        <hr>
-                        <h5>🖼️ Референсы аватарок</h5>
-                        <p class="hint">Аватарки отправляются как визуальные референсы. Модель будет копировать внешность с них.</p>
-
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_auto_detect_names" ${settings.autoDetectNames ? 'checked' : ''}>
-                            <span>🔍 Автоопределение имён в промпте</span>
-                        </label>
-                        <p class="hint">Если имя персонажа/юзера/NPC упомянуто в промпте — его аватарка автоматически добавится как референс.</p>
-
-                        <!-- Character Avatar -->
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_send_char_avatar" ${settings.sendCharAvatar ? 'checked' : ''}>
-                            <span>Всегда отправлять аватар персонажа</span>
-                        </label>
-                        <div id="iig_char_avatar_preview" class="iig-avatar-preview-container">
-                            <div class="iig-avatar-preview-empty"><i class="fa-solid fa-user"></i><span>Нет аватара</span></div>
-                        </div>
-
-                        <!-- User Avatar -->
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_send_user_avatar" ${settings.sendUserAvatar ? 'checked' : ''}>
-                            <span>Всегда отправлять аватар юзера</span>
-                        </label>
-
-                        <div id="iig_user_avatar_row" class="flex-row ${!settings.sendUserAvatar ? 'hidden' : ''}" style="margin-top: 5px; align-items: center;">
-                            <label for="iig_user_avatar_file">Аватар юзера</label>
-                            <select id="iig_user_avatar_file" class="flex1">
-                                <option value="">-- Не выбран --</option>
-                                ${settings.userAvatarFile ? `<option value="${settings.userAvatarFile}" selected>${settings.userAvatarFile}</option>` : ''}
-                            </select>
-                            <div id="iig_refresh_avatars" class="menu_button iig-refresh-btn" title="Обновить"><i class="fa-solid fa-sync"></i></div>
-                        </div>
-                        <div id="iig_user_avatar_preview" class="iig-avatar-preview-container ${!settings.sendUserAvatar ? 'hidden' : ''}">
-                            <div class="iig-avatar-preview-empty"><i class="fa-solid fa-user"></i><span>Не выбран</span></div>
-                        </div>
-
-                        <hr>
-                        <h5>🎭 NPC / Дополнительные персонажи</h5>
-                        <p class="hint">Добавьте NPC с аватарками. При упоминании имени NPC в промпте его аватарка будет использована как референс.</p>
-
-                        <div id="iig_npc_list"></div>
-                        <div id="iig_add_npc" class="menu_button" style="width: 100%; margin-top: 8px;">
-                            <i class="fa-solid fa-plus"></i> Добавить NPC
-                        </div>
-
-                        <hr>
-                        <h5>🎨 Пользовательские промпты</h5>
-                        <p class="hint">Positive добавляется в начало, Negative — как инструкция избегания.</p>
-
-                        <div class="flex-col" style="margin-bottom: 8px;">
-                            <label for="iig_positive_prompt">Positive промпт</label>
-                            <textarea id="iig_positive_prompt" class="text_pole" rows="2" placeholder="masterpiece, best quality...">${settings.positivePrompt || ''}</textarea>
-                        </div>
-                        <div class="flex-col" style="margin-bottom: 8px;">
-                            <label for="iig_negative_prompt">Negative промпт</label>
-                            <textarea id="iig_negative_prompt" class="text_pole" rows="2" placeholder="low quality, blurry...">${settings.negativePrompt || ''}</textarea>
-                        </div>
-
-                        <hr>
-                        <h5>🖼️ Фиксированный стиль</h5>
-                        <p class="hint">Применяется ко ВСЕМ генерациям.</p>
-
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_fixed_style_enabled" ${settings.fixedStyleEnabled ? 'checked' : ''}>
-                            <span>Включить фиксированный стиль</span>
-                        </label>
-                        <div class="flex-col" style="margin-top: 5px;">
-                            <label for="iig_fixed_style">Стиль</label>
-                            <input type="text" id="iig_fixed_style" class="text_pole" value="${settings.fixedStyle || ''}" placeholder="Anime semi-realistic style...">
-                        </div>
-
-                        <hr>
-                        <h5>👤 Извлечение внешности</h5>
-
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_extract_appearance" ${settings.extractAppearance ? 'checked' : ''}>
-                            <span>Из карточки персонажа</span>
-                        </label>
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_extract_user_appearance" ${settings.extractUserAppearance !== false ? 'checked' : ''}>
-                            <span>Из персоны юзера</span>
-                        </label>
-
-                        <hr>
-                        <h5>👕 Определение одежды</h5>
-
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_detect_clothing" ${settings.detectClothing ? 'checked' : ''}>
-                            <span>Определять одежду из чата</span>
-                        </label>
-                        <div class="flex-row" style="margin-top: 5px;">
-                            <label for="iig_clothing_depth">Глубина поиска</label>
-                            <input type="number" id="iig_clothing_depth" class="text_pole flex1" value="${settings.clothingSearchDepth || 5}" min="1" max="20">
-                        </div>
-                    </div>
-
-                    <hr>
-                    <h4>Обработка ошибок</h4>
-
-                    <div class="flex-row">
-                        <label for="iig_max_retries">Макс. повторов</label>
-                        <input type="number" id="iig_max_retries" class="text_pole flex1" value="${settings.maxRetries}" min="0" max="5">
-                    </div>
-                    <div class="flex-row">
-                        <label for="iig_retry_delay">Задержка (мс)</label>
-                        <input type="number" id="iig_retry_delay" class="text_pole flex1" value="${settings.retryDelay}" min="500" max="10000" step="500">
-                    </div>
-
-                    <hr>
-                    <h4>Отладка</h4>
-                    <div class="flex-row">
-                        <div id="iig_export_logs" class="menu_button" style="width: 100%;"><i class="fa-solid fa-download"></i> Экспорт логов</div>
-                    </div>
+                    ${createCollapsibleSection('api', '🔌', 'Настройки API', apiSectionContent)}
+                    ${createCollapsibleSection('gen_params', '⚙️', 'Параметры генерации', genParamsSectionContent)}
+                    ${createCollapsibleSection('references', '🖼️', 'Референсы аватарок', referencesSectionContent)}
+                    ${createCollapsibleSection('wardrobe', '👗', 'Гардероб (одежда)', wardrobeSectionContent)}
+                    ${createCollapsibleSection('npcs', '🎭', 'NPC / Доп. персонажи', npcSectionContent)}
+                    ${createCollapsibleSection('prompts', '✍️', 'Пользовательские промпты', promptsSectionContent)}
+                    ${createCollapsibleSection('fixed_style', '🎨', 'Фиксированный стиль', styleSectionContent)}
+                    ${createCollapsibleSection('extraction', '👤', 'Извлечение внешности и одежды', extractionSectionContent)}
+                    ${createCollapsibleSection('errors', '🔄', 'Обработка ошибок', errorSectionContent)}
+                    ${createCollapsibleSection('debug', '🐛', 'Отладка', debugSectionContent)}
                 </div>
             </div>
         </div>
     `;
 
     container.insertAdjacentHTML('beforeend', html);
+
+    // Bind collapsible toggles
+    document.querySelectorAll('[data-section-toggle]').forEach(header => {
+        header.addEventListener('click', () => {
+            const sectionId = header.dataset.sectionToggle;
+            toggleSectionCollapsed(sectionId);
+            const section = header.closest('.iig-section');
+            const body = section.querySelector('.iig-section-body');
+            const chevron = section.querySelector('.iig-section-chevron');
+            body.classList.toggle('iig-section-hidden');
+            chevron.classList.toggle('iig-collapsed');
+        });
+    });
+
     bindSettingsEvents();
     renderNpcList();
-
-    // Initial preview updates
+    renderWardrobeGrid('char');
+    renderWardrobeGrid('user');
     updateCharAvatarPreview();
     updateUserAvatarPreview();
 }
@@ -1397,7 +1594,6 @@ function bindSettingsEvents() {
 
     document.getElementById('iig_api_type')?.addEventListener('change', (e) => {
         settings.apiType = e.target.value; saveSettings();
-        document.getElementById('iig_avatar_section')?.classList.toggle('hidden', e.target.value !== 'gemini');
     });
 
     document.getElementById('iig_endpoint')?.addEventListener('input', (e) => { settings.endpoint = e.target.value; saveSettings(); });
@@ -1415,7 +1611,6 @@ function bindSettingsEvents() {
         if (isGeminiModel(e.target.value)) {
             document.getElementById('iig_api_type').value = 'gemini';
             settings.apiType = 'gemini';
-            document.getElementById('iig_avatar_section')?.classList.remove('hidden');
         }
     });
 
@@ -1455,7 +1650,7 @@ function bindSettingsEvents() {
     document.getElementById('iig_user_avatar_file')?.addEventListener('change', (e) => {
         settings.userAvatarFile = e.target.value;
         saveSettings();
-        updateUserAvatarPreview(); // Update preview when selection changes
+        updateUserAvatarPreview();
     });
 
     document.getElementById('iig_refresh_avatars')?.addEventListener('click', async (e) => {
@@ -1470,7 +1665,7 @@ function bindSettingsEvents() {
                 select.appendChild(opt);
             }
             toastr.success(`Найдено аватаров: ${avatars.length}`);
-            updateUserAvatarPreview(); // Update preview after refreshing list
+            updateUserAvatarPreview();
         } catch (err) { toastr.error('Ошибка загрузки аватаров'); }
         finally { btn.classList.remove('loading'); }
     });
@@ -1489,6 +1684,32 @@ function bindSettingsEvents() {
     document.getElementById('iig_extract_user_appearance')?.addEventListener('change', (e) => { settings.extractUserAppearance = e.target.checked; saveSettings(); });
     document.getElementById('iig_detect_clothing')?.addEventListener('change', (e) => { settings.detectClothing = e.target.checked; saveSettings(); });
     document.getElementById('iig_clothing_depth')?.addEventListener('input', (e) => { settings.clothingSearchDepth = parseInt(e.target.value) || 5; saveSettings(); });
+
+    // Wardrobe add buttons
+    const bindWardrobeAdd = (target) => {
+        const addBtn = document.getElementById(`iig_wardrobe_${target}_add`);
+        const fileInput = document.getElementById(`iig_wardrobe_${target}_file`);
+        const nameInput = document.getElementById(`iig_wardrobe_${target}_name`);
+
+        addBtn?.addEventListener('click', () => fileInput?.click());
+        fileInput?.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onloadend = async () => {
+                const resized = await resizeImageBase64(reader.result.split(',')[1], 512);
+                const name = nameInput?.value?.trim() || file.name.replace(/\.[^.]+$/, '') || 'Outfit';
+                addWardrobeItem(name, resized, target);
+                if (nameInput) nameInput.value = '';
+                fileInput.value = '';
+                renderWardrobeGrid(target);
+                toastr.success(`Одежда "${name}" добавлена`);
+            };
+            reader.readAsDataURL(file);
+        });
+    };
+    bindWardrobeAdd('char');
+    bindWardrobeAdd('user');
 }
 
 // ============================================================
@@ -1502,13 +1723,13 @@ function bindSettingsEvents() {
     context.eventSource.on(context.event_types.APP_READY, () => {
         createSettingsUI();
         addButtonsToExistingMessages();
-        console.log('[IIG] Inline Image Generation v2.1 loaded');
+        console.log('[IIG] Inline Image Generation v2.2 loaded');
     });
 
     context.eventSource.on(context.event_types.CHAT_CHANGED, () => {
         setTimeout(() => {
             addButtonsToExistingMessages();
-            updateCharAvatarPreview(); // Update char avatar when switching chats
+            updateCharAvatarPreview();
         }, 100);
     });
 
@@ -1516,5 +1737,5 @@ function bindSettingsEvents() {
         await onMessageReceived(messageId);
     });
 
-    console.log('[IIG] Inline Image Generation v2.1 initialized');
+    console.log('[IIG] Inline Image Generation v2.2 initialized');
 })();
